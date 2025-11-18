@@ -401,4 +401,4 @@ If you open a PR, please include:
 
 ## 📄 License
 
-This project is licensed under the MIT License (or update this section to your preferred license).
+This project is licensed under the MIT License.
