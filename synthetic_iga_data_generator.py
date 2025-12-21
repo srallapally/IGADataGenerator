@@ -11,6 +11,7 @@ Special handling for Epic with dual entitlement attributes (linkedTemplates, lin
 
 Usage:
     python synthetic_data_generator.py --config data_generator_config.json
+    12/21/25 Initial vers
 """
 
 import argparse
