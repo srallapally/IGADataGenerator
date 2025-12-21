@@ -1,11 +1,11 @@
 {
-  "base_url": <base url>",
-  "client_id": "<client_id>",
-  "client_secret": "<client_secret>",
+  "base_url":"https://openam-sg-iga-26.forgeblocks.com",
+  "client_id": "iga_client",
+  "client_secret": "abcd1234",
   "max_unique_values": 100,
   "feature_selection_method": "cramers_v",
   "chi_square_p_threshold": 0.5,
-  "cramers_v_threshold": 0.02,
+  "cramers_v_threshold": 0.2,
   "page_size": 100,
   "max_num_features": 10,
   "export_exclude_attributes": [
@@ -39,7 +39,7 @@
         "groups",
         "reports",
         "manager",
-        "custom_encrypted_password"
+        "custom_encryptedPassword"
   ],
   "skip_features": [
       "_id",

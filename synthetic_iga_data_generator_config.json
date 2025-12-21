@@ -1,0 +1,446 @@
+{
+  "_comment_header": "=======================================================================",
+  "_comment_title": "Synthetic IGA Data Generator Configuration",
+  "_comment_version": "Version: 1.3.0",
+  "_comment_description": "This configuration file controls the generation of synthetic Identity Governance and Administration (IGA) data including identities, entitlements, and access grants.",
+  "_comment_footer": "=======================================================================",
+
+  "global": {
+    "_comment": "Global settings affecting the entire generation process",
+
+    "seed": {
+      "_comment": "Random seed for reproducibility. Using the same seed produces identical output.",
+      "value": 42
+    },
+
+    "output_directory": {
+      "_comment": "Directory where all generated CSV files will be saved. Created if it doesn't exist.",
+      "value": "./out"
+    },
+
+    "multi_value_delimiter": {
+      "_comment": "Delimiter used to separate multiple values in multi-valued attributes (e.g., entitlement grants).",
+      "value": "#"
+    },
+
+    "csv_quoting": {
+      "_comment": "CSV quoting style: 'all' (quote all fields), 'minimal' (quote only when necessary), 'none'.",
+      "value": "all"
+    },
+
+    "log_level": {
+      "_comment": "Logging verbosity: 'DEBUG', 'INFO', 'WARNING', 'ERROR'.",
+      "value": "INFO"
+    }
+  },
+
+  "identity": {
+    "_comment": "Configuration for generating synthetic user identities",
+
+    "num_identities": {
+      "_comment": "Total number of user identities to generate.",
+      "value": 1000
+    },
+
+    "pct_users_without_manager": {
+      "_comment": "Percentage of users who will have no manager assigned (null manager_id). Range: 0.0 to 1.0. This is read directly by the generator (no hard-coded default).",
+      "value": 0.10
+    },
+
+    "distribution_employee_contractor": {
+      "_comment": "Distribution of employment types. Keys are employment type names, values are proportions (must sum to 1.0).",
+      "value": {
+        "Employee": 0.90,
+        "Contractor": 0.10
+      }
+    },
+
+    "distribution_human_ai_agent": {
+      "_comment": "Distribution of identity types (human vs AI/service accounts). Must sum to 1.0.",
+      "value": {
+        "Human": 0.95,
+        "AI_Agent": 0.05
+      }
+    },
+
+    "distribution_active_inactive": {
+      "_comment": "Distribution of account status. Must sum to 1.0.",
+      "value": {
+        "Active": 0.93,
+        "Inactive": 0.07
+      }
+    },
+
+    "manager_hierarchy": {
+      "_comment": "Settings for generating realistic manager hierarchy",
+      "min_hierarchy_depth": {
+        "_comment": "Minimum levels in the management chain (1 = flat org).",
+        "value": 3
+      },
+      "max_direct_reports": {
+        "_comment": "Maximum number of direct reports per manager.",
+        "value": 15
+      },
+      "pct_managers": {
+        "_comment": "Approximate percentage of identities who are managers.",
+        "value": 0.25
+      }
+    },
+
+    "tenure": {
+      "_comment": "Settings for generating tenure (years of service) using Beta distribution",
+      "beta_a": {
+        "_comment": "Alpha parameter for Beta distribution (controls skewness).",
+        "value": 2.0
+      },
+      "beta_b": {
+        "_comment": "Beta parameter for Beta distribution.",
+        "value": 5.0
+      },
+      "scale_years": {
+        "_comment": "Maximum tenure in years (Beta result is multiplied by this).",
+        "value": 20.0
+      }
+    },
+
+    "input_files": {
+      "_comment": "Paths to input CSV files for sourcing realistic attribute values",
+      "departments": {
+        "_comment": "CSV with department data. Expected columns: department_id, department_name, Industry, Type.",
+        "value": "input/departments.csv"
+      },
+      "jobtitles": {
+        "_comment": "CSV with job title data. Expected columns: Job Title, Department, Industry, Category.",
+        "value": "input/jobtitles.csv"
+      }
+    }
+  },
+
+  "applications": {
+    "_comment": "Configuration for applications and their entitlements. AWS, Salesforce, ServiceNow, and Epic are MANDATORY.",
+
+    "num_apps": {
+      "_comment": "Total number of applications to generate. Minimum is 4 (the mandatory apps). Set higher to auto-generate additional apps (not currently used by the generator).",
+      "value": 6
+    },
+
+    "mandatory_apps": {
+      "_comment": "List of mandatory application names. These must always be included and will always end up with at least one entitlement, at least one account with grants, and all of their entitlements used at least once in grants.",
+      "value": ["AWS", "Salesforce", "ServiceNow", "Epic"]
+    },
+
+    "additional_app_pool": {
+      "_comment": "Pool of application names to choose from when generating additional apps beyond the mandatory 4.",
+      "value": [
+        "Workday", "Okta", "GitHub", "Slack", "Jira", "Confluence",
+        "Tableau", "Snowflake", "Box", "Dropbox", "Zoom", "Teams",
+        "Oracle", "SAP", "NetSuite", "Concur", "DocuSign", "Splunk",
+        "Zendesk", "HubSpot", "Marketo", "Anaplan", "Coupa", "Ariba"
+      ]
+    },
+
+    "additional_app_defaults": {
+      "_comment": "Default configuration for auto-generated additional applications",
+      "entitlements_range": {
+        "_comment": "Min and max number of entitlements for additional apps",
+        "value": [30, 80]
+      },
+      "criticality_distribution": {
+        "_comment": "Default criticality distribution for additional apps",
+        "value": {
+          "High": 0.15,
+          "Medium": 0.50,
+          "Low": 0.35
+        }
+      }
+    },
+
+    "apps": {
+      "_comment": "Explicit configuration for each mandatory application",
+      "value": [
+        {
+          "app_name": "AWS",
+          "app_id": "APP_AWS",
+          "_comment": "MANDATORY - Amazon Web Services - IAM policies as entitlements",
+          "enabled": true,
+          "num_entitlements": 100,
+          "input_file": {
+            "path": "input/aws_policies.csv",
+            "entitlement_id_column": "policy_id",
+            "entitlement_name_column": "policy_name",
+            "description_column": "description"
+          },
+          "entitlement_attributes": [
+            {
+              "attribute_name": "entitlement_grants",
+              "_comment": "Standard single multi-valued attribute for AWS policy assignments"
+            }
+          ],
+          "criticality_distribution": {
+            "High": 0.20,
+            "Medium": 0.50,
+            "Low": 0.30
+          }
+        },
+        {
+          "app_name": "Salesforce",
+          "app_id": "APP_SFDC",
+          "_comment": "MANDATORY - Salesforce CRM - Licenses and Permission Sets as entitlements",
+          "enabled": true,
+          "num_entitlements": 100,
+          "input_files": [
+            {
+              "path": "input/Salesforce_Licenses.csv",
+              "entitlement_id_column": "license_id",
+              "entitlement_name_column": "license_name",
+              "entitlement_type": "License"
+            },
+            {
+              "path": "input/Salesforce_Permission_Sets.csv",
+              "entitlement_id_column": "permission_set_id",
+              "entitlement_name_column": "permission_set_name",
+              "description_column": "description",
+              "entitlement_type": "PermissionSet"
+            }
+          ],
+          "entitlement_attributes": [
+            {
+              "attribute_name": "entitlement_grants"
+            }
+          ],
+          "criticality_distribution": {
+            "High": 0.15,
+            "Medium": 0.45,
+            "Low": 0.40
+          }
+        },
+        {
+          "app_name": "ServiceNow",
+          "app_id": "APP_SNOW",
+          "_comment": "MANDATORY - ServiceNow ITSM - Groups as entitlements",
+          "enabled": true,
+          "num_entitlements": 50,
+          "input_file": {
+            "path": "input/service_now_groups.csv",
+            "entitlement_id_column": "group_id",
+            "entitlement_name_column": "group_name",
+            "description_column": "group_description"
+          },
+          "entitlement_attributes": [
+            {
+              "attribute_name": "entitlement_grants"
+            }
+          ],
+          "criticality_distribution": {
+            "High": 0.10,
+            "Medium": 0.40,
+            "Low": 0.50
+          }
+        },
+        {
+          "app_name": "Epic",
+          "app_id": "APP_EPIC",
+          "_comment": "MANDATORY - Epic EHR - Special case with TWO entitlement attributes: linkedTemplates and linkedSubTemplates",
+          "enabled": true,
+          "num_entitlements": 500,
+          "entitlement_attributes": [
+            {
+              "attribute_name": "linkedTemplates",
+              "_comment": "Primary Epic templates (linked templates)",
+              "input_file": {
+                "path": "input/epic_linked_templates.csv",
+                "entitlement_id_column": "Value",
+                "entitlement_name_column": "Title"
+              },
+              "grants_per_user": {
+                "mean": 3,
+                "std_dev": 2,
+                "min": 0,
+                "max": 10
+              }
+            },
+            {
+              "attribute_name": "linkedSubTemplates",
+              "_comment": "Secondary Epic templates (sub-templates)",
+              "input_file": {
+                "path": "input/epic_sub_templates.csv",
+                "entitlement_id_column": "Value",
+                "entitlement_name_column": "Title"
+              },
+              "grants_per_user": {
+                "mean": 5,
+                "std_dev": 3,
+                "min": 0,
+                "max": 15
+              }
+            }
+          ],
+          "criticality_distribution": {
+            "High": 0.25,
+            "Medium": 0.45,
+            "Low": 0.30
+          }
+        }
+      ]
+    }
+  },
+
+  "grants": {
+    "_comment": "Configuration for entitlement grant distribution (bell curve / normal distribution)",
+
+    "distribution_type": {
+      "_comment": "Type of distribution: 'normal' (bell curve), 'uniform', 'exponential'.",
+      "value": "normal"
+    },
+
+    "mean_entitlements_per_user": {
+      "_comment": "Average number of entitlements per user per app (center of bell curve).",
+      "value": 8
+    },
+
+    "std_dev_entitlements": {
+      "_comment": "Standard deviation controlling the spread of the bell curve.",
+      "value": 3
+    },
+
+    "min_entitlements": {
+      "_comment": "Minimum entitlements per user per app (lower bound, clips the distribution).",
+      "value": 0
+    },
+
+    "max_entitlements": {
+      "_comment": "Maximum entitlements per user per app (upper bound, clips the distribution).",
+      "value": 25
+    },
+
+    "pct_users_with_3_plus": {
+      "_comment": "Target percentage of users with at least 3 entitlements (across all apps). Used for post-generation enforcement.",
+      "value": 0.80
+    },
+
+    "pct_users_with_less_than_3": {
+      "_comment": "Target percentage of users with fewer than 3 entitlements.",
+      "value": 0.20
+    }
+  },
+
+  "confidence": {
+    "_comment": "Configuration for confidence score calculation and distribution",
+
+    "distribution": {
+      "_comment": "Target distribution of confidence score buckets. Must sum to 1.0. The generator assigns confidence buckets to approximately match this distribution per app.",
+      "value": {
+        "high": 0.35,
+        "medium": 0.30,
+        "low": 0.30,
+        "none": 0.05
+      }
+    },
+
+    "thresholds": {
+      "_comment": "Confidence score boundaries for bucket classification",
+      "value": {
+        "high": {
+          "min": 0.70
+        },
+        "medium": {
+          "min": 0.40
+        },
+        "low": {
+          "min": 0.01
+        }
+      }
+    },
+
+    "calculation_method": {
+      "_comment": "Method for calculating confidence: 'rule_support' (based on feature-entitlement association), 'random_weighted' (simpler, faster).",
+      "value": "rule_support"
+    },
+
+    "output_format": {
+      "_comment": "How to output confidence: 'score' (numeric 0.0-1.0), 'bucket' (High/Medium/Low/None), 'both'.",
+      "value": "both"
+    }
+  },
+
+  "features": {
+    "_comment": "Configuration for user attributes used in association rule mining (ARM) and confidence scoring",
+
+    "mandatory_features": {
+      "_comment": "Features that MUST always be included in ARM. Cannot be removed.",
+      "value": ["manager", "department", "jobcode"]
+    },
+
+    "additional_features": {
+      "_comment": "Optional features that may be used in ARM based on statistical significance.",
+      "value": ["location_country", "location_site", "employment_type", "business_unit", "job_level", "department_type", "job_category"]
+    },
+
+    "num_features_for_rules": {
+      "_comment": "Desired total number of features to use in rule antecedents / confidence scoring. The generator will select up to this many from mandatory+additional.",
+      "value": 4
+    },
+
+    "feature_selection_method": {
+      "_comment": "Method to select additional features: 'cramers_v' (effect size) or 'chi_square' (p-value).",
+      "value": "cramers_v"
+    }
+  },
+
+  "feature_validation": {
+    "_comment": "Settings for validating generated data produces meaningful features (uses feature_recommender.py logic)",
+
+    "enabled": {
+      "_comment": "Whether to run feature validation after data generation.",
+      "value": true
+    },
+
+    "cramers_v_threshold": {
+      "_comment": "Minimum Cramér's V value for a feature to be considered statistically significant. Higher values push the generator to create stronger feature -> entitlement signals, which supports meeting the configured confidence bucket distribution.",
+      "value": 0.2
+    },
+
+    "chi_square_p_threshold": {
+      "_comment": "Maximum p-value for chi-square test (only used if feature_selection_method is 'chi_square').",
+      "value": 0.05
+    },
+
+    "max_unique_values": {
+      "_comment": "Maximum unique values for a feature to pass cardinality filter. Higher values may reduce statistical power.",
+      "value": 50
+    },
+
+    "fail_on_validation_error": {
+      "_comment": "If true, generation fails if mandatory features don't pass validation. If false, only warns.",
+      "value": false
+    },
+
+    "validation_sample_size": {
+      "_comment": "Number of records to sample for validation (null = use all). Sampling speeds up validation.",
+      "value": 5000
+    }
+  },
+
+  "output": {
+    "_comment": "Configuration for output file generation",
+
+    "generate_qa_summary": {
+      "_comment": "Whether to generate a QA summary report after generation.",
+      "value": true
+    },
+
+    "generate_statistics": {
+      "_comment": "Whether to generate detailed statistics files.",
+      "value": true
+    },
+
+    "file_naming": {
+      "_comment": "Pattern for output file names. {app_name} and {app_id} are replaced with actual values.",
+      "identities": "identities.csv",
+      "entitlements_pattern": "{app_name}_entitlements.csv",
+      "accounts_pattern": "{app_name}_accounts.csv",
+      "qa_summary": "qa_summary.txt",
+      "statistics": "generation_statistics.json"
+    }
+  }
+}

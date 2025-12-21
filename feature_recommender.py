@@ -111,6 +111,25 @@ def recommend_features(df_users, config: dict):
         col for col in df_users.columns
         if col not in skip_columns
     ]
+    # === START PATCH 5.4: Drop Constant Columns ===
+    # Filter out columns with 0 or 1 unique values (no statistical signal)
+    constant_cols = [
+        col for col in categorical_columns
+        if df_users[col].nunique() <= 1
+    ]
+
+    # Update categorical_columns to exclude the constant ones
+    categorical_columns = [
+        col for col in categorical_columns
+        if col not in constant_cols
+    ]
+
+    if constant_cols:
+        print(f'\n=== FILTER 0: Constant Columns (Dropped) ===')
+        print(f'- Dropped {len(constant_cols)} columns containing <= 1 unique value.')
+        # Uncomment the line below if you want to see exactly which columns were dropped
+        # print(f'  Columns: {constant_cols}')
+    # === END PATCH 5.4 ===
 
     print(f'- Number of users: {len(df_users)}')
     print(f'- Feature selection method: {FEATURE_SELECTION_METHOD}')
