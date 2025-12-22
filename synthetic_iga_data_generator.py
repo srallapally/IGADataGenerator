@@ -64,6 +64,7 @@ class ConfigLoader:
             self.config = json.load(f)
 
         self._flatten_values()  # Must come BEFORE _validate()
+        self._expand_applications()
         self._validate()
 
         return self.config
@@ -130,6 +131,71 @@ class ConfigLoader:
             else:
                 return default
         return value
+
+    def _expand_applications(self) -> None:
+        """
+        Ensure the applications list matches applications.num_apps.
+
+        If num_apps > len(apps), auto-generate additional apps using
+        additional_app_pool and additional_app_defaults.
+        """
+        apps_cfg = self.config.get('applications', {})
+        num_apps = apps_cfg.get('num_apps', 4)
+        apps_list = apps_cfg.get('apps', [])
+
+        current_count = len(apps_list)
+        if num_apps <= current_count:
+            self.logger.info(f"Applications already configured: {current_count} (num_apps={num_apps})")
+            return
+
+        additional_needed = num_apps - current_count
+        self.logger.info(f"Generating {additional_needed} additional applications to reach num_apps={num_apps}")
+
+        # Pool of candidate names for auto-generated apps
+        app_pool = apps_cfg.get('additional_app_pool', [])
+        existing_names = {app.get('app_name') for app in apps_list}
+        available_names = [name for name in app_pool if name not in existing_names]
+
+        # Defaults for additional apps
+        defaults = apps_cfg.get('additional_app_defaults', {})
+        ent_range = defaults.get('entitlements_range', [30, 80])
+        crit_dist = defaults.get('criticality_distribution', {
+            "High": 0.15,
+            "Medium": 0.50,
+            "Low": 0.35,
+        })
+
+        for i in range(additional_needed):
+            if i < len(available_names):
+                app_name = available_names[i]
+            else:
+                # Fallback name if pool is exhausted
+                app_name = f"App_{current_count + i + 1}"
+
+            # Choose a reasonable entitlement count (midpoint of range)
+            if isinstance(ent_range, list) and len(ent_range) == 2:
+                min_ents, max_ents = ent_range
+                num_ents = int((min_ents + max_ents) / 2)
+            else:
+                num_ents = 50
+
+            app_id = f"APP_{app_name.upper().replace(' ', '_').replace('-', '_')}"
+
+            new_app = {
+                "app_name": app_name,
+                "app_id": app_id,
+                "enabled": True,
+                "num_entitlements": num_ents,
+                # No input_file(s); entitlements will be synthetic via EntitlementGenerator
+                "criticality_distribution": crit_dist
+            }
+
+            apps_list.append(new_app)
+            self.logger.info(f"  Added auto-generated app: {app_name} ({app_id}), num_entitlements={num_ents}")
+
+        # Persist back to config
+        self.config["applications"]["apps"] = apps_list
+        self.logger.info(f"Total applications configured after expansion: {len(apps_list)}")
 
 
 # =============================================================================

@@ -50,8 +50,9 @@
     "distribution_employee_contractor": {
       "_comment": "Distribution of employment types. Keys are employment type names, values are proportions (must sum to 1.0).",
       "value": {
-        "Employee": 0.90,
-        "Contractor": 0.10
+        "Employee": 0.70,
+        "Contractor": 0.20,
+        "Intern": 0.10
       }
     },
 
@@ -170,12 +171,6 @@
             "entitlement_name_column": "policy_name",
             "description_column": "description"
           },
-          "entitlement_attributes": [
-            {
-              "attribute_name": "entitlement_grants",
-              "_comment": "Standard single multi-valued attribute for AWS policy assignments"
-            }
-          ],
           "criticality_distribution": {
             "High": 0.20,
             "Medium": 0.50,
@@ -203,11 +198,6 @@
               "entitlement_type": "PermissionSet"
             }
           ],
-          "entitlement_attributes": [
-            {
-              "attribute_name": "entitlement_grants"
-            }
-          ],
           "criticality_distribution": {
             "High": 0.15,
             "Medium": 0.45,
@@ -226,11 +216,6 @@
             "entitlement_name_column": "group_name",
             "description_column": "group_description"
           },
-          "entitlement_attributes": [
-            {
-              "attribute_name": "entitlement_grants"
-            }
-          ],
           "criticality_distribution": {
             "High": 0.10,
             "Medium": 0.40,
@@ -378,7 +363,7 @@
 
     "num_features_for_rules": {
       "_comment": "Desired total number of features to use in rule antecedents / confidence scoring. The generator will select up to this many from mandatory+additional.",
-      "value": 4
+      "value": 8
     },
 
     "feature_selection_method": {
