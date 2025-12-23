@@ -45,6 +45,10 @@ class RuleGeneratorConfig:
     min_entitlements_per_rule: int = 1
     max_entitlements_per_rule: int = 4
 
+    # Coordinated cross-app rule generation
+    coordinate_rules_across_apps: bool = False
+    num_unique_feature_patterns: Optional[int] = None
+
     def __post_init__(self):
         if self.confidence_distribution is None:
             self.confidence_distribution = {
@@ -173,34 +177,82 @@ class DynamicRuleGenerator:
         all_rules = []
         rule_counter = 1
 
-        for app in self.apps:
-            app_name = app['app_name']
+        # === BEGIN MODIFICATION: Check for coordinated mode ===
+        # Check if we should use coordinated cross-app patterns
+        coordinate_mode = getattr(self.config, 'coordinate_rules_across_apps', False)
 
-            if app_name not in self.entitlements_by_app:
-                self.logger.warning(f"No entitlements found for {app_name}, skipping")
-                continue
+        if coordinate_mode:
+            self.logger.info("=" * 60)
+            self.logger.info("COORDINATED MODE: Using shared feature patterns across apps")
+            self.logger.info("=" * 60)
 
-            entitlements = self.entitlements_by_app[app_name]
+            # Generate shared feature patterns once
+            num_patterns = getattr(self.config, 'num_unique_feature_patterns', self.config.num_rules_per_app)
+            shared_patterns = self._generate_shared_feature_patterns(num_patterns)
 
-            if not entitlements:
-                self.logger.warning(f"Empty entitlement list for {app_name}, skipping")
-                continue
+            if not shared_patterns:
+                self.logger.error("Failed to generate shared feature patterns. Falling back to independent mode.")
+                coordinate_mode = False  # Fall back to original behavior
+            else:
+                self.logger.info(f"Using {len(shared_patterns)} shared patterns across {len(self.apps)} apps")
 
-            self.logger.info(f"Generating {self.config.num_rules_per_app} rules for {app_name}")
+                # Generate rules for each app using the shared patterns
+                for app in self.apps:
+                    app_name = app['app_name']
 
-            app_rules = self._generate_rules_for_app(
-                app_name=app_name,
-                entitlements=entitlements,
-                num_rules=self.config.num_rules_per_app,
-                start_id=rule_counter
-            )
+                    if app_name not in self.entitlements_by_app:
+                        self.logger.warning(f"No entitlements found for {app_name}, skipping")
+                        continue
 
-            all_rules.extend(app_rules)
-            rule_counter += len(app_rules)
+                    entitlements = self.entitlements_by_app[app_name]
+
+                    if not entitlements:
+                        self.logger.warning(f"Empty entitlement list for {app_name}, skipping")
+                        continue
+
+                    self.logger.info(f"Generating {len(shared_patterns)} rules for {app_name} using shared patterns")
+
+                    # Generate one rule per shared pattern for this app
+                    app_rules = self._generate_rules_from_patterns(
+                        app_name=app_name,
+                        entitlements=entitlements,
+                        feature_patterns=shared_patterns,
+                        start_id=rule_counter
+                    )
+
+                    all_rules.extend(app_rules)
+                    rule_counter += len(app_rules)
+        # === END MODIFICATION ===
+
+        # Original independent mode (fallback)
+        if not coordinate_mode:
+            for app in self.apps:
+                app_name = app['app_name']
+
+                if app_name not in self.entitlements_by_app:
+                    self.logger.warning(f"No entitlements found for {app_name}, skipping")
+                    continue
+
+                entitlements = self.entitlements_by_app[app_name]
+
+                if not entitlements:
+                    self.logger.warning(f"Empty entitlement list for {app_name}, skipping")
+                    continue
+
+                self.logger.info(f"Generating {self.config.num_rules_per_app} rules for {app_name}")
+
+                app_rules = self._generate_rules_for_app(
+                    app_name=app_name,
+                    entitlements=entitlements,
+                    num_rules=self.config.num_rules_per_app,
+                    start_id=rule_counter
+                )
+
+                all_rules.extend(app_rules)
+                rule_counter += len(app_rules)
 
         self.logger.info(f"Generated {len(all_rules)} total rules across {len(self.apps)} apps")
         return all_rules
-
     def _generate_rules_for_app(self,
                                 app_name: str,
                                 entitlements: List[Dict[str, str]],
@@ -365,6 +417,159 @@ class DynamicRuleGenerator:
             f"(3) lower support_range.min below {self.config.support_range[0]}"
         )
         return None
+
+    def _generate_shared_feature_patterns(self, num_patterns: int) -> List[Dict[str, str]]:
+        """
+        Generate a pool of feature patterns that will be shared across all apps.
+        Each pattern will be used to create one rule per app.
+
+        Args:
+            num_patterns: Number of unique feature patterns to generate
+
+        Returns:
+            List of feature pattern dictionaries
+        """
+        # === BEGIN NEW METHOD ===
+        self.logger.info(f"Generating {num_patterns} shared feature patterns...")
+
+        patterns = []
+        attempts = 0
+        max_attempts = num_patterns * 20  # More attempts for shared patterns
+
+        while len(patterns) < num_patterns and attempts < max_attempts:
+            attempts += 1
+
+            # Generate a random feature pattern (reuse existing logic)
+            pattern = self._select_feature_combination()
+
+            # Check if pattern is unique and viable
+            if pattern:
+                # Convert to tuple for comparison
+                pattern_tuple = tuple(sorted(pattern.items()))
+
+                # Check if already in patterns list
+                is_duplicate = any(
+                    tuple(sorted(p.items())) == pattern_tuple
+                    for p in patterns
+                )
+
+                if not is_duplicate:
+                    # Verify sufficient users match this pattern
+                    matching_users = self.feature_analyzer.estimate_population_with_features(pattern)
+
+                    # Need at least 10 users for viability
+                    if matching_users >= 10:
+                        patterns.append(pattern)
+                        self.logger.info(f"  Pattern {len(patterns)}: {pattern} ({matching_users} users)")
+
+        if len(patterns) < num_patterns:
+            self.logger.warning(
+                f"Could only generate {len(patterns)}/{num_patterns} shared patterns. "
+                f"Consider: (1) lowering num_unique_feature_patterns, (2) increasing num_identities"
+            )
+
+        self.logger.info(f"Generated {len(patterns)} shared feature patterns")
+        return patterns
+        # === END NEW METHOD ===
+
+    def _generate_rules_from_patterns(self,
+                                      app_name: str,
+                                      entitlements: List[Dict[str, str]],
+                                      feature_patterns: List[Dict[str, str]],
+                                      start_id: int) -> List[Dict]:
+        """
+        Generate rules for an app using pre-defined feature patterns.
+
+        Args:
+            app_name: Name of the application
+            entitlements: Available entitlements for this app
+            feature_patterns: Pre-generated feature combinations to use
+            start_id: Starting rule ID number
+
+        Returns:
+            List of generated rules
+        """
+        # === BEGIN NEW METHOD ===
+        rules = []
+
+        # Sample confidence buckets
+        num_patterns = len(feature_patterns)
+        confidence_buckets = self._sample_confidence_buckets(num_patterns)
+
+        for i, pattern in enumerate(feature_patterns):
+            rule_id = f"R{start_id + i:03d}"
+            confidence_bucket = confidence_buckets[i]
+
+            # Get population stats for this pattern
+            matching_population = self.feature_analyzer.estimate_population_with_features(pattern)
+            total_population = len(self.users_df)
+
+            # Sample confidence
+            conf_range = self.config.confidence_ranges[confidence_bucket]
+            confidence = self.rng.uniform(conf_range[0], conf_range[1])
+
+            # Calculate support
+            max_support = matching_population / total_population
+            support_min, support_max = self.config.support_range
+
+            actual_min_support = max(support_min, 0.001)
+            actual_max_support = min(support_max, max_support * 0.9)
+
+            if actual_min_support >= actual_max_support:
+                actual_max_support = actual_min_support + 0.01
+
+            support = self.rng.uniform(actual_min_support, actual_max_support)
+
+            # Sample Cramér's V
+            cramers_v = self.rng.uniform(
+                self.config.cramers_v_range[0],
+                self.config.cramers_v_range[1]
+            )
+
+            # Select entitlements
+            num_entitlements = self.rng.integers(
+                self.config.min_entitlements_per_rule,
+                self.config.max_entitlements_per_rule + 1
+            )
+            num_entitlements = min(num_entitlements, len(entitlements))
+
+            selected_ents = self.rng.choice(entitlements, size=num_entitlements, replace=False)
+            entitlement_ids = [e['entitlement_id'] for e in selected_ents]
+
+            # Create description
+            description = self._create_rule_description(
+                antecedent=pattern,
+                app_name=app_name,
+                entitlements=selected_ents
+            )
+
+            # Build rule
+            rule = {
+                'rule_id': rule_id,
+                'app_name': app_name,
+                'description': description,
+                'antecedent': pattern,
+                'consequent': {
+                    'entitlements': entitlement_ids
+                },
+                'strength': {
+                    'confidence': round(confidence, 3),
+                    'support': round(support, 3),
+                    'target_cramers_v': round(cramers_v, 3)
+                },
+                'metadata': {
+                    'confidence_bucket': confidence_bucket,
+                    'matching_population': int(matching_population),
+                    'total_population': int(total_population),
+                    'coordinated': True  # Flag to indicate this uses shared pattern
+                }
+            }
+
+            rules.append(rule)
+            self.logger.debug(f"Created rule {rule_id} for {app_name} using pattern: {pattern}")
+
+        return rules
+        # === END NEW METHOD ===
 
     def _select_feature_combination(self) -> Optional[Dict[str, str]]:
         """Select a random combination of features and values."""
@@ -599,6 +804,48 @@ class RuleGenerationOrchestrator:
 
             self.entitlements_by_app[app_name] = entitlements
             self.logger.info(f"Loaded {len(entitlements)} entitlements for {app_name}")
+
+    def _generate_shared_feature_patterns(self, num_patterns: int) -> List[Dict[str, str]]:
+        """
+        Generate a pool of feature patterns that will be shared across all apps.
+        Each pattern will be used to create one rule per app.
+
+        Args:
+            num_patterns: Number of unique feature patterns to generate
+
+        Returns:
+            List of feature pattern dictionaries
+        """
+        # === BEGIN NEW METHOD ===
+        self.logger.info(f"Generating {num_patterns} shared feature patterns...")
+
+        patterns = []
+        attempts = 0
+        max_attempts = num_patterns * 10
+
+        while len(patterns) < num_patterns and attempts < max_attempts:
+            attempts += 1
+
+            # Generate a random feature pattern (reuse existing logic)
+            pattern = self._select_random_feature_combination()
+
+            # Check if pattern is unique and viable
+            if pattern and pattern not in patterns:
+                # Verify sufficient users match this pattern
+                mask = pd.Series([True] * len(self.users_df))
+                for feature, value in pattern.items():
+                    mask &= (self.users_df[feature] == value)
+
+                matching_users = mask.sum()
+
+                # Need at least 10 users for viability
+                if matching_users >= 10:
+                    patterns.append(pattern)
+                    self.logger.info(f"  Pattern {len(patterns)}: {pattern} ({matching_users} users)")
+
+        self.logger.info(f"Generated {len(patterns)} shared feature patterns")
+        return patterns
+        # === END NEW METHOD ===
 
     def _generate_rules(self):
         """Generate rules dynamically."""

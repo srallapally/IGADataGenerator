@@ -43,7 +43,7 @@
 
     "num_identities": {
       "_comment": "Total number of user identities to generate.",
-      "value": 1500
+      "value": 3500
     },
 
     "pct_users_without_manager": {
@@ -411,6 +411,16 @@
       "value": 6
     },
 
+    "coordinate_rules_across_apps": {
+      "_comment_new": "NEW: Enable coordinated rules across apps",
+      "value":true
+    },
+
+    "num_unique_feature_patterns": {
+       "_comment_num_unique_patterns": "NEW: Number of unique feature patterns to generate (used across all apps)",
+       "value": 6
+    },
+
     "confidence_distribution": {
       "_comment": "Distribution of confidence levels across generated rules. Must sum to 1.0. Higher confidence = rules fire more consistently.",
       "value": {
@@ -441,8 +451,8 @@
     "support_range": {
       "_comment": "Min/max support values for rules. support = P(features AND entitlements) - how common the pattern is.",
       "value": {
-        "min": 0.005,
-        "max": 0.20
+        "min": 0.001,
+        "max": 0.15
       }
     },
 
@@ -461,7 +471,7 @@
 
     "max_features_per_rule": {
       "_comment": "Maximum number of features in rule antecedent",
-      "value": 3
+      "value": 1
     },
 
     "min_entitlements_per_rule": {
@@ -481,7 +491,7 @@
 
     "max_cardinality": {
       "_comment": "Maximum unique values for a feature to be eligible for rules",
-      "value": 50
+      "value": 20
     },
 
     "output_file": {

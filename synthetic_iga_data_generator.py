@@ -1866,6 +1866,35 @@ class SyntheticDataGenerator:
             stats = qa_reporter.generate_statistics()
             self.data_writer.write_statistics(stats)
 
+    def _count_viable_feature_combinations(self) -> int:
+        """
+        Count how many viable feature combinations exist for rule generation.
+        Returns the number of combinations that have sufficient users.
+        """
+        # === BEGIN NEW METHOD ===
+        features_cfg = self.config.get('features', {})
+        mandatory = features_cfg.get('mandatory_features', ['manager', 'department', 'jobcode'])
+        additional = features_cfg.get('additional_features', [])
+
+        all_features = mandatory + additional
+        available = [f for f in all_features if f in self.identities_df.columns]
+
+        # Count viable combinations (need at least 10 users per combination)
+        min_users_per_combo = 10
+        viable_count = 0
+
+        # 1-feature combinations
+        for feature in available[:5]:  # Check first 5 features
+            value_counts = self.identities_df[feature].value_counts()
+            viable_count += (value_counts >= min_users_per_combo).sum()
+
+        self.logger.info(f"Viable feature combinations (≥{min_users_per_combo} users): {viable_count}")
+        self.logger.info(f"  This supports up to {viable_count} unique rules total")
+        self.logger.info(f"  With coordination, this supports {viable_count} rules PER APP")
+
+        return viable_count
+        # === END NEW METHOD ===
+
     def _generate_dynamic_rules(self, seed: int) -> None:
         """
         Generate association rules dynamically based on actual user population
@@ -1880,6 +1909,8 @@ class SyntheticDataGenerator:
         if not dynamic_config.get('enabled', False):
             self.logger.info("Dynamic rule generation is disabled. Using pre-defined rules from rules_directory.")
             return
+
+        viable_combinations = self._count_viable_feature_combinations()
 
         if not DYNAMIC_RULES_AVAILABLE:
             self.logger.warning("Dynamic rule generator not available. Skipping dynamic rule generation.")
