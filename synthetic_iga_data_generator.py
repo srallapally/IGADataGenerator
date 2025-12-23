@@ -1028,6 +1028,8 @@ class AccountGenerator:
             if app_config.get('enabled', True):
                 self.generate_for_app(app_config)
 
+        self._enforce_per_app_grant_distribution()
+
         # Enforce 80/20 rule across all apps
         self._enforce_grant_distribution()
 
@@ -1038,6 +1040,105 @@ class AccountGenerator:
         self._ensure_mandatory_entitlement_coverage()
 
         return self.accounts_by_app
+
+    def _enforce_per_app_grant_distribution(self) -> None:
+        """Ensure target percentage of users have at least 3 entitlements PER APPLICATION."""
+        grants_cfg = self.config.get('grants', {})
+        target_pct_per_app = grants_cfg.get('pct_users_with_3_plus_per_app')
+
+        # If not configured or set to null, skip per-app enforcement
+        if target_pct_per_app is None:
+            self.logger.info("Per-app entitlement distribution enforcement disabled")
+            return
+
+        target_pct_per_app = float(target_pct_per_app)
+        self.logger.info(f"Enforcing {target_pct_per_app:.0%} users with 3+ entitlements per app...")
+
+        for app_name, accounts in self.accounts_by_app.items():
+            num_users = len(accounts)
+            if num_users == 0:
+                continue
+
+            # Count users with 3+ entitlements in this app
+            users_with_3_plus = 0
+            users_needing_boost = []
+
+            for account in accounts:
+                total_ents = sum(len(grants) for grants in account.entitlement_grants.values())
+                if total_ents >= 3:
+                    users_with_3_plus += 1
+                else:
+                    users_needing_boost.append(account)
+
+            current_pct = users_with_3_plus / num_users if num_users > 0 else 0
+            self.logger.info(f"{app_name}: Current {current_pct:.1%} users have 3+ entitlements")
+
+            if current_pct >= target_pct_per_app:
+                continue  # Already meeting target for this app
+
+            # Calculate how many users need boosting
+            target_count = int(num_users * target_pct_per_app)
+            shortfall = target_count - users_with_3_plus
+
+            # Get available entitlements for this app
+            entitlements = self.entitlements_by_app.get(app_name, [])
+            if not entitlements:
+                self.logger.warning(f"No entitlements available for {app_name} to enforce distribution")
+                continue
+
+            # Shuffle users needing boost and select the number needed
+            self.rng.shuffle(users_needing_boost)
+            users_to_boost = users_needing_boost[:min(shortfall, len(users_needing_boost))]
+
+            # Boost selected users to have at least 3 entitlements
+            for account in users_to_boost:
+                current_total = sum(len(grants) for grants in account.entitlement_grants.values())
+                needed = 3 - current_total
+
+                if needed <= 0:
+                    continue
+
+                # Get the first attribute name for this app
+                attr_name = list(account.entitlement_grants.keys())[0]
+                current_grants = set(account.entitlement_grants[attr_name])
+
+                # For Epic, handle both attribute types
+                if app_name == "Epic":
+                    # Distribute across both linkedTemplates and linkedSubTemplates
+                    linked_templates = [e.entitlement_id for e in entitlements if
+                                        e.entitlement_type == 'linkedTemplates']
+                    sub_templates = [e.entitlement_id for e in entitlements if
+                                     e.entitlement_type == 'linkedSubTemplates']
+
+                    # Add to linkedTemplates first
+                    current_linked = set(account.entitlement_grants.get('linkedTemplates', []))
+                    available_linked = [e for e in linked_templates if e not in current_linked]
+                    if available_linked and needed > 0:
+                        to_add = min(needed, len(available_linked), 2)  # Add up to 2
+                        new_grants = self.rng.choice(available_linked, size=to_add, replace=False).tolist()
+                        account.entitlement_grants.setdefault('linkedTemplates', [])
+                        account.entitlement_grants['linkedTemplates'].extend(new_grants)
+                        needed -= to_add
+
+                    # Add to linkedSubTemplates if still needed
+                    current_sub = set(account.entitlement_grants.get('linkedSubTemplates', []))
+                    available_sub = [e for e in sub_templates if e not in current_sub]
+                    if available_sub and needed > 0:
+                        to_add = min(needed, len(available_sub))
+                        new_grants = self.rng.choice(available_sub, size=to_add, replace=False).tolist()
+                        account.entitlement_grants.setdefault('linkedSubTemplates', [])
+                        account.entitlement_grants['linkedSubTemplates'].extend(new_grants)
+                else:
+                    # Standard apps - add to the single entitlement attribute
+                    ent_ids = [e.entitlement_id for e in entitlements]
+                    available = [e for e in ent_ids if e not in current_grants]
+
+                    if available:
+                        to_add = min(needed, len(available))
+                        new_grants = self.rng.choice(available, size=to_add, replace=False).tolist()
+                        account.entitlement_grants[attr_name].extend(new_grants)
+
+            self.logger.info(f"{app_name}: Boosted {len(users_to_boost)} users to meet {target_pct_per_app:.0%} target")
 
     def _ensure_mandatory_app_grants(self) -> None:
         """Guarantee that each mandatory app has at least one account with entitlement grants."""

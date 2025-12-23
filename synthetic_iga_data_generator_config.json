@@ -88,7 +88,7 @@
       },
       "pct_managers": {
         "_comment": "Approximate percentage of identities who are managers.",
-        "value": 0.25
+        "value": 0.15
       }
     },
 
@@ -131,7 +131,7 @@
 
     "mandatory_apps": {
       "_comment": "List of mandatory application names.",
-      "value": ["AWS", "Salesforce", "ServiceNow", "Epic"]
+      "value": ["AWS", "Salesforce", "ServiceNow", "Epic","SAP"]
     },
 
     "additional_app_pool": {
@@ -139,7 +139,7 @@
       "value": [
         "Workday", "Okta", "GitHub", "Slack", "Jira", "Confluence",
         "Tableau", "Snowflake", "Box", "Dropbox", "Zoom", "Teams",
-        "Oracle", "SAP", "NetSuite", "Concur", "DocuSign", "Splunk",
+        "Oracle", "NetSuite", "Concur", "DocuSign", "Splunk",
         "Zendesk", "HubSpot", "Marketo", "Anaplan", "Coupa", "Ariba"
       ]
     },
@@ -163,6 +163,24 @@
     "apps": {
       "_comment": "Explicit configuration for each mandatory application",
       "value": [
+         {
+          "app_name": "SAP",
+          "app_id": "APP_SAP",
+          "_comment": "MANDATORY - SAP - SAP Roles as entitlements",
+          "enabled": true,
+          "num_entitlements": 100,
+          "input_file": {
+            "path": "input/sap_roles.csv",
+            "entitlement_id_column": "AGR_ID",
+            "entitlement_name_column": "AGR_NAME",
+            "description_column": "AGR_DESCRIPTION"
+          },
+          "criticality_distribution": {
+            "High": 0.20,
+            "Medium": 0.50,
+            "Low": 0.30
+          }
+        },
         {
           "app_name": "AWS",
           "app_id": "APP_AWS",
@@ -284,7 +302,7 @@
 
     "mean_entitlements_per_user": {
       "_comment": "Average number of entitlements per user per app (center of bell curve).",
-      "value": 8
+      "value": 10
     },
 
     "std_dev_entitlements": {
