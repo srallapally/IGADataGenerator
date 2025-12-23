@@ -31,6 +31,10 @@
     "log_level": {
       "_comment": "Logging verbosity: 'DEBUG', 'INFO', 'WARNING', 'ERROR'.",
       "value": "INFO"
+    },
+    "rules_directory": {
+      "_comment": "Directory containing <app_name>_rules.json files for Workflow A",
+      "value": "./rules"
     }
   },
 
@@ -345,6 +349,10 @@
     "output_format": {
       "_comment": "How to output confidence: 'score' (numeric 0.0-1.0), 'bucket' (High/Medium/Low/None), 'both'.",
       "value": "both"
+    },
+    "pct_modelled_users": {
+      "_comment": "Fraction of users per app whose entitlements are generated from association rules (Workflow A).",
+      "value": 0.93
     }
   },
 

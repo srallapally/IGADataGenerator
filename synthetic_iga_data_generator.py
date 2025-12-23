@@ -24,6 +24,7 @@ from collections import defaultdict, Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from AssociationRuleEngine import RuleEngine, AssociationRule
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # External dependencies
@@ -720,7 +721,25 @@ class EntitlementGenerator:
                         description=description[:100] if description else f"{app_name} {ent_type}: {ent_name[:40]}"
                     ))
                     self.ent_counter += 1
+        else:
+            num_ents = app_config.get('num_entitlements', 50)
+            self.logger.info(f"No input files for {app_name}, generating {num_ents} synthetic entitlements")
 
+            for i in range(num_ents):
+                ent_id = f"{app_id}_E{self.ent_counter:07d}"
+                ent_name = f"{app_name}_Entitlement_{i + 1}"
+
+                criticality = self._weighted_choice(criticality_dist)
+                entitlements.append(Entitlement(
+                    entitlement_id=ent_id,
+                    entitlement_name=ent_name,
+                    app_id=app_id,
+                    app_name=app_name,
+                    entitlement_type='standard',
+                    criticality=criticality,
+                    description=f"{app_name} synthetic entitlement {i + 1}"
+                ))
+                self.ent_counter += 1
         self.entitlements_by_app[app_name] = entitlements
         self.logger.info(f"Generated {len(entitlements)} entitlements for {app_name}")
         return entitlements
@@ -808,7 +827,8 @@ class AccountGenerator:
 
     def __init__(self, config: Dict[str, Any], rng: Generator,
                  identities: List[Identity],
-                 entitlements_by_app: Dict[str, List[Entitlement]]):
+                 entitlements_by_app: Dict[str, List[Entitlement]],
+                 rule_engine: Optional[RuleEngine] = None):
         self.config = config
         self.rng = rng
         self.identities = identities
@@ -817,6 +837,9 @@ class AccountGenerator:
 
         self.accounts_by_app: Dict[str, List[Account]] = {}
         self.delimiter = config.get('global', {}).get('multi_value_delimiter', '#')
+        self.rule_engine = rule_engine
+        # Internal: keep rules used per (app_name, user_id) if needed
+        self._rules_used: Dict[Tuple[str, str], List[AssociationRule]] = {}
 
     def _get_grant_count(self, app_config: Dict[str, Any], attr_name: str = None) -> int:
         """Get number of entitlements to grant using bell curve distribution."""
@@ -865,26 +888,72 @@ class AccountGenerator:
             # Standard account generation
             ent_ids = [e.entitlement_id for e in entitlements]
 
-            for identity in self.identities:
-                num_grants = self._get_grant_count(app_config)
+            # Fraction of users whose assignments will be based on rules
+            pct_modelled = float(
+                self.config.get('confidence', {}).get('pct_modelled_users', 0.93)
+            )
 
-                if num_grants > 0 and ent_ids:
-                    granted = self.rng.choice(
+            for identity in self.identities:
+                use_rules = (
+                        self.rule_engine is not None
+                        and self.rule_engine.has_rules(app_name)
+                        and self.rng.random() < pct_modelled
+                )
+                if use_rules and ent_ids:
+                    # Seed with a small random subset, then expand via rules
+                    seed_count = max(1, min(2, len(ent_ids)))
+                    seed = self.rng.choice(
                         ent_ids,
-                        size=min(num_grants, len(ent_ids)),
+                        size=seed_count,
                         replace=False
                     ).tolist()
+
+                    recs, used_rules = self.rule_engine.suggest_entitlements_for_app(
+                        app_name=app_name,
+                        current_entitlements=seed,
+                        max_rules=3
+                    )
+
+                    final_ents = sorted(set(seed + recs))
+
+                    # Optional small amount of noise
+                    if self.rng.random() < 0.10 and len(ent_ids) > len(final_ents):
+                        noise = self.rng.choice(
+                            [e for e in ent_ids if e not in final_ents],
+                            size=1,
+                            replace=False
+                        ).tolist()
+                        final_ents = sorted(set(final_ents + noise))
+
+                    coverage = RuleEngine.compute_rule_coverage(final_ents, used_rules)
+                    score = RuleEngine.score_from_coverage_and_conf(coverage, used_rules)
+                    bucket = RuleEngine.bucket_from_score(score)
+
+                    if used_rules:
+                        self._rules_used[(app_name, identity.user_id)] = used_rules
                 else:
-                    granted = []
+                    num_grants = self._get_grant_count(app_config)
+
+                    if num_grants > 0 and ent_ids:
+                        final_ents = self.rng.choice(
+                            ent_ids,
+                            size=min(num_grants, len(ent_ids)),
+                            replace=False
+                        ).tolist()
+                    else:
+                        final_ents = []
+
+                    score = None
+                    bucket = None
 
                 accounts.append(Account(
                     user_id=identity.user_id,
                     user_name=identity.user_name,
                     app_id=app_id,
                     app_name=app_name,
-                    entitlement_grants={'entitlement_grants': granted},
-                    confidence_score=None,  # Set later
-                    confidence_bucket=None
+                    entitlement_grants={'entitlement_grants': final_ents},
+                    confidence_score=score,
+                    confidence_bucket=bucket
                 ))
 
         self.accounts_by_app[app_name] = accounts
@@ -1162,6 +1231,11 @@ class ConfidenceScoreCalculator:
     def calculate_scores(self) -> None:
         """Calculate confidence scores for all accounts."""
         self.logger.info("Calculating confidence scores...")
+        method = str(self.confidence_cfg.get('calculation_method', 'random_weighted')).lower()
+        if method == "rule_support":
+            # Workflow A: scores already set during account generation.
+            self.logger.info("Confidence method 'rule_support' – skipping random bucket assignment.")
+            return
 
         distribution = self.confidence_cfg.get('distribution', {
             'high': 0.35, 'medium': 0.30, 'low': 0.30, 'none': 0.05
@@ -1616,9 +1690,13 @@ class SyntheticDataGenerator:
         self.entitlement_generator = EntitlementGenerator(self.config, rng, faker, self.input_reader)
         self.entitlements_by_app = self.entitlement_generator.generate_all()
 
+        # NEW: Initialize rule engine (Workflow A)
+        rules_dir = Path(self.config.get('global', {}).get('rules_directory', 'rules'))
+        rule_engine = RuleEngine(rules_dir=rules_dir, rng=rng)
+
         # Step 6: Generate accounts/grants
         self.account_generator = AccountGenerator(
-            self.config, rng, self.identities, self.entitlements_by_app
+            self.config, rng, self.identities, self.entitlements_by_app, rule_engine=rule_engine
         )
         self.accounts_by_app = self.account_generator.generate_all()
 
