@@ -212,20 +212,43 @@ class DynamicRuleGenerator:
         # Determine confidence bucket distribution for this app
         confidence_buckets = self._sample_confidence_buckets(num_rules)
 
+        failed_attempts = 0
+        max_total_attempts = num_rules * 100  # Allow more attempts
+
         for i in range(num_rules):
             rule_id = f"R{start_id + i:03d}"
             confidence_bucket = confidence_buckets[i]
 
-            # Generate rule
-            rule = self._generate_single_rule(
-                rule_id=rule_id,
-                app_name=app_name,
-                entitlements=entitlements,
-                confidence_bucket=confidence_bucket
-            )
+            # Generate rule with retry logic
+            rule = None
+            attempts = 0
+            while rule is None and attempts < 100 and failed_attempts < max_total_attempts:
+                rule = self._generate_single_rule(
+                    rule_id=rule_id,
+                    app_name=app_name,
+                    entitlements=entitlements,
+                    confidence_bucket=confidence_bucket
+                )
+                attempts += 1
+                if rule is None:
+                    failed_attempts += 1
 
             if rule:
                 rules.append(rule)
+            else:
+                self.logger.warning(
+                    f"Could not generate rule {rule_id} after {attempts} attempts. "
+                    f"Consider: (1) reducing num_rules_per_app, (2) increasing population size, "
+                    f"(3) lowering support_range.min"
+                )
+
+        if not rules:
+            self.logger.error(
+                f"Failed to generate any rules for {app_name}. "
+                f"Population may be too small or constraints too tight. "
+                f"Try: (1) increase num_identities, (2) reduce support_range.min, "
+                f"(3) increase max_features_per_rule"
+            )
 
         return rules
 
@@ -274,6 +297,8 @@ class DynamicRuleGenerator:
             # Support must be achievable given population
             max_support = matching_population / total_population
             support_min, support_max = self.config.support_range
+
+            # BEGIN FIX: Ensure valid range
             # Calculate actual achievable support
             actual_min_support = max(support_min, 0.01)
             actual_max_support = min(support_max, max_support * 0.9)
@@ -283,6 +308,7 @@ class DynamicRuleGenerator:
                 continue  # Try a different feature combination
 
             support = self.rng.uniform(actual_min_support, actual_max_support)
+            # END FIX
 
             cramers_v = self.rng.uniform(
                 self.config.cramers_v_range[0],
@@ -332,7 +358,12 @@ class DynamicRuleGenerator:
 
             return rule
 
-        self.logger.warning(f"Failed to generate rule {rule_id} after {max_attempts} attempts")
+        self.logger.warning(
+            f"Failed to generate rule {rule_id} after {max_attempts} attempts. "
+            f"This usually means feature combinations are too restrictive or population is too small. "
+            f"Suggestions: (1) reduce num_rules_per_app, (2) increase num_identities, "
+            f"(3) lower support_range.min below {self.config.support_range[0]}"
+        )
         return None
 
     def _select_feature_combination(self) -> Optional[Dict[str, str]]:
@@ -608,19 +639,40 @@ class RuleGenerationOrchestrator:
         """Save rules to JSON file."""
         self.logger.info(f"Saving rules to {self.output_file}")
 
+        # Convert numpy types to native Python types for JSON serialization
+        def convert_to_native_types(obj):
+            """Recursively convert numpy types to native Python types."""
+            import numpy as np
+
+            if isinstance(obj, dict):
+                return {k: convert_to_native_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_native_types(item) for item in obj]
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+
+        # Convert rules to native Python types
+        rules_native = convert_to_native_types(self.rules)
+
         output = {
-            'rules': self.rules,
+            'rules': rules_native,
             'metadata': {
-                'total_identities': len(self.users_df),
-                'total_rules': len(self.rules),
+                'total_identities': int(len(self.users_df)),  # Ensure int
+                'total_rules': int(len(self.rules)),  # Ensure int
                 'cramers_v_tolerance': 0.05,
-                'generation_seed': self.seed,
+                'generation_seed': int(self.seed),  # Ensure int
                 'applications': [app['app_name'] for app in self.apps_config],
                 'generation_config': {
-                    'num_rules_per_app': self.config.num_rules_per_app,
+                    'num_rules_per_app': int(self.config.num_rules_per_app),
                     'confidence_distribution': self.config.confidence_distribution,
-                    'support_range': self.config.support_range,
-                    'cramers_v_range': self.config.cramers_v_range
+                    'support_range': list(self.config.support_range),
+                    'cramers_v_range': list(self.config.cramers_v_range)
                 }
             }
         }
