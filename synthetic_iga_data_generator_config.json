@@ -413,7 +413,7 @@
 
      "num_cross_app_rules": {
       "_comment": "Number of association rules to generate per application",
-       "value": 10
+       "value": 50
     },
 
     "apps_per_rule_min": {
@@ -496,22 +496,22 @@
 
     "min_features_per_rule": {
       "_comment": "Minimum number of features in rule antecedent",
-      "value": 1
+      "value": 3
     },
 
     "max_features_per_rule": {
       "_comment": "Maximum number of features in rule antecedent",
-      "value": 1
+      "value": 10
     },
 
     "min_entitlements_per_rule": {
       "_comment": "Minimum number of entitlements granted by each rule",
-      "value": 1
+      "value": 3
     },
 
     "max_entitlements_per_rule": {
       "_comment": "Maximum number of entitlements granted by each rule",
-      "value": 4
+      "value": 20
     },
 
     "min_cardinality": {
