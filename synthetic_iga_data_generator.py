@@ -27,6 +27,19 @@ from pathlib import Path
 from AssociationRuleEngine import RuleEngine, AssociationRule
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# BEGIN PATCH 1: Import dynamic rule generator
+try:
+    from dynamic_rule_generator import (
+        RuleGeneratorConfig,
+        RuleGenerationOrchestrator
+    )
+    DYNAMIC_RULES_AVAILABLE = True
+except ImportError:
+    DYNAMIC_RULES_AVAILABLE = False
+    import warnings
+    warnings.warn("dynamic_rule_generator not available. Dynamic rule generation will be disabled.")
+# END PATCH 1
+
 # External dependencies
 try:
     import numpy as np
@@ -1690,6 +1703,10 @@ class SyntheticDataGenerator:
         self.entitlement_generator = EntitlementGenerator(self.config, rng, faker, self.input_reader)
         self.entitlements_by_app = self.entitlement_generator.generate_all()
 
+        # BEGIN PATCH 3: Step 5.5: Generate dynamic rules
+        self._generate_dynamic_rules(seed)
+        # END PATCH 3
+
         # NEW: Initialize rule engine (Workflow A)
         rules_dir = Path(self.config.get('global', {}).get('rules_directory', 'rules'))
         rule_engine = RuleEngine(rules_dir=rules_dir, rng=rng)
@@ -1748,7 +1765,119 @@ class SyntheticDataGenerator:
             stats = qa_reporter.generate_statistics()
             self.data_writer.write_statistics(stats)
 
+    def _generate_dynamic_rules(self, seed: int) -> None:
+        """
+        Generate association rules dynamically based on actual user population
+        and available entitlements.
 
+        This is the critical step that creates intentional feature-to-entitlement
+        associations with target statistical strength.
+        """
+        # BEGIN PATCH 2: Dynamic rule generation method
+        dynamic_config = self.config.get('dynamic_rules', {})
+
+        if not dynamic_config.get('enabled', False):
+            self.logger.info("Dynamic rule generation is disabled. Using pre-defined rules from rules_directory.")
+            return
+
+        if not DYNAMIC_RULES_AVAILABLE:
+            self.logger.warning("Dynamic rule generator not available. Skipping dynamic rule generation.")
+            return
+
+        self.logger.info("=" * 60)
+        self.logger.info("GENERATING ASSOCIATION RULES DYNAMICALLY")
+        self.logger.info("=" * 60)
+
+        # Prepare configuration for dynamic rule generator
+        confidence_ranges_config = dynamic_config.get('confidence_ranges', {})
+
+        # Convert nested config structure to tuple format expected by RuleGeneratorConfig
+        confidence_ranges = {}
+        for bucket, range_cfg in confidence_ranges_config.items():
+            if isinstance(range_cfg, dict):
+                confidence_ranges[bucket] = (
+                    range_cfg.get('min', 0.0),
+                    range_cfg.get('max', 1.0)
+                )
+            else:
+                confidence_ranges[bucket] = (0.65, 0.95)  # fallback
+
+        # Get support range
+        support_range_cfg = dynamic_config.get('support_range', {})
+        if isinstance(support_range_cfg, dict):
+            support_range = (
+                support_range_cfg.get('min', 0.01),
+                support_range_cfg.get('max', 0.20)
+            )
+        else:
+            support_range = (0.01, 0.20)
+
+        # Get cramers_v range
+        cramers_v_range_cfg = dynamic_config.get('cramers_v_range', {})
+        if isinstance(cramers_v_range_cfg, dict):
+            cramers_v_range = (
+                cramers_v_range_cfg.get('min', 0.30),
+                cramers_v_range_cfg.get('max', 0.50)
+            )
+        else:
+            cramers_v_range = (0.30, 0.50)
+
+        rule_gen_config = RuleGeneratorConfig(
+            num_rules_per_app=dynamic_config.get('num_rules_per_app', 5),
+            confidence_distribution=dynamic_config.get('confidence_distribution', {
+                'high': 0.40,
+                'medium': 0.35,
+                'low': 0.25
+            }),
+            confidence_ranges=confidence_ranges if confidence_ranges else None,
+            support_range=support_range,
+            cramers_v_range=cramers_v_range,
+            min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
+            max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
+            min_entitlements_per_rule=dynamic_config.get('min_entitlements_per_rule', 1),
+            max_entitlements_per_rule=dynamic_config.get('max_entitlements_per_rule', 4)
+        )
+
+        # Prepare rules directory
+        rules_dir = Path(self.config.get('global', {}).get('rules_directory', './rules'))
+        rules_dir.mkdir(parents=True, exist_ok=True)
+
+        # Output file path
+        output_filename = dynamic_config.get('output_file', 'generated_rules.json')
+        output_path = rules_dir / output_filename
+
+        # Get apps configuration
+        apps_cfg = self.config.get('applications', {})
+        apps_list = apps_cfg.get('apps', [])
+        enabled_apps = [
+            {'app_name': app['app_name'], 'app_id': app.get('app_id', f"APP_{app['app_name'].upper()}")}
+            for app in apps_list
+            if app.get('enabled', True)
+        ]
+
+        # Run dynamic rule generation orchestrator
+        try:
+            orchestrator = RuleGenerationOrchestrator(
+                users_file=self.data_writer.output_dir / 'identities.csv',
+                apps_config=enabled_apps,
+                entitlements_dir=self.data_writer.output_dir,
+                output_file=output_path,
+                config=rule_gen_config,
+                seed=seed
+            )
+
+            orchestrator.run()
+
+            self.logger.info(f"Dynamic rules successfully generated: {output_path}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to generate dynamic rules: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Fall back to using existing rules if available
+            self.logger.warning("Falling back to pre-defined rules from rules_directory")
+        # END PATCH 2
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
