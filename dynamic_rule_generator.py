@@ -177,9 +177,12 @@ class DynamicRuleGenerator:
         all_rules = []
         rule_counter = 1
 
-        # === BEGIN MODIFICATION: Check for coordinated mode ===
-        # Check if we should use coordinated cross-app patterns
-        coordinate_mode = getattr(self.config, 'coordinate_rules_across_apps', False)
+        # Check if coordinate_rules_across_apps attribute exists on config
+        if hasattr(self.config, 'coordinate_rules_across_apps'):
+            coordinate_mode = self.config.coordinate_rules_across_apps
+        else:
+            coordinate_mode = False
+        # END MODIFICATIO
 
         if coordinate_mode:
             self.logger.info("=" * 60)
@@ -188,6 +191,13 @@ class DynamicRuleGenerator:
 
             # Generate shared feature patterns once
             num_patterns = getattr(self.config, 'num_unique_feature_patterns', self.config.num_rules_per_app)
+            if num_patterns is None:
+                num_patterns = self.config.num_rules_per_app
+            # Ensure it's an integer, not a dict
+            if isinstance(num_patterns, dict):
+                num_patterns = num_patterns.get('value', self.config.num_rules_per_app)
+            num_patterns = int(num_patterns)
+
             shared_patterns = self._generate_shared_feature_patterns(num_patterns)
 
             if not shared_patterns:
@@ -907,31 +917,16 @@ class RuleGenerationOrchestrator:
         # Convert rules to native Python types
         rules_native = convert_to_native_types(self.rules)
 
-        output = {
-            'rules': rules_native,
-            'metadata': {
-                'total_identities': int(len(self.users_df)),  # Ensure int
-                'total_rules': int(len(self.rules)),  # Ensure int
-                'cramers_v_tolerance': 0.05,
-                'generation_seed': int(self.seed),  # Ensure int
-                'applications': [app['app_name'] for app in self.apps_config],
-                'generation_config': {
-                    'num_rules_per_app': int(self.config.num_rules_per_app),
-                    'confidence_distribution': self.config.confidence_distribution,
-                    'support_range': list(self.config.support_range),
-                    'cramers_v_range': list(self.config.cramers_v_range)
-                }
-            }
-        }
-
+        # BEGIN FIX: Save as flat list instead of nested object
+        # RuleEngine expects a flat JSON array of rules, not a nested structure
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
 
         with open(self.output_file, 'w') as f:
-            json.dump(output, f, indent=2)
+            json.dump(rules_native, f, indent=2)
+        # END FIX
 
         self.logger.info(f"Rules saved successfully")
-
-
+        self.logger.info(f"  Format: Flat list of {len(rules_native)} rules (compatible with RuleEngine)")
 # =============================================================================
 # CLI
 # =============================================================================

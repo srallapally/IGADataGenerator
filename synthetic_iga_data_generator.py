@@ -1895,15 +1895,13 @@ class SyntheticDataGenerator:
         return viable_count
         # === END NEW METHOD ===
 
+
     def _generate_dynamic_rules(self, seed: int) -> None:
         """
         Generate association rules dynamically based on actual user population
         and available entitlements.
 
-        This is the critical step that creates intentional feature-to-entitlement
-        associations with target statistical strength.
         """
-        # BEGIN PATCH 2: Dynamic rule generation method
         dynamic_config = self.config.get('dynamic_rules', {})
 
         if not dynamic_config.get('enabled', False):
@@ -1920,10 +1918,17 @@ class SyntheticDataGenerator:
         self.logger.info("GENERATING ASSOCIATION RULES DYNAMICALLY")
         self.logger.info("=" * 60)
 
-        # Prepare configuration for dynamic rule generator
+        # BEGIN NEW: Check if cross-app mode is requested
+        use_cross_app = dynamic_config.get('use_cross_app_rules', False)
+        if isinstance(use_cross_app, dict):
+            use_cross_app = use_cross_app.get('value', False)
+            use_cross_app = bool(use_cross_app)
+        # END NEW
+
+        # Prepare common configuration elements
         confidence_ranges_config = dynamic_config.get('confidence_ranges', {})
 
-        # Convert nested config structure to tuple format expected by RuleGeneratorConfig
+        # Convert nested config structure to tuple format
         confidence_ranges = {}
         for bucket, range_cfg in confidence_ranges_config.items():
             if isinstance(range_cfg, dict):
@@ -1932,7 +1937,7 @@ class SyntheticDataGenerator:
                     range_cfg.get('max', 1.0)
                 )
             else:
-                confidence_ranges[bucket] = (0.65, 0.95)  # fallback
+                confidence_ranges[bucket] = (0.65, 0.95)
 
         # Get support range
         support_range_cfg = dynamic_config.get('support_range', {})
@@ -1954,22 +1959,6 @@ class SyntheticDataGenerator:
         else:
             cramers_v_range = (0.30, 0.50)
 
-        rule_gen_config = RuleGeneratorConfig(
-            num_rules_per_app=dynamic_config.get('num_rules_per_app', 5),
-            confidence_distribution=dynamic_config.get('confidence_distribution', {
-                'high': 0.40,
-                'medium': 0.35,
-                'low': 0.25
-            }),
-            confidence_ranges=confidence_ranges if confidence_ranges else None,
-            support_range=support_range,
-            cramers_v_range=cramers_v_range,
-            min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
-            max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
-            min_entitlements_per_rule=dynamic_config.get('min_entitlements_per_rule', 1),
-            max_entitlements_per_rule=dynamic_config.get('max_entitlements_per_rule', 4)
-        )
-
         # Prepare rules directory
         rules_dir = Path(self.config.get('global', {}).get('rules_directory', './rules'))
         rules_dir.mkdir(parents=True, exist_ok=True)
@@ -1984,11 +1973,124 @@ class SyntheticDataGenerator:
         enabled_apps = [
             {'app_name': app['app_name'], 'app_id': app.get('app_id', f"APP_{app['app_name'].upper()}")}
             for app in apps_list
-            if app.get('enabled', True)
+                if app.get('enabled', True)
         ]
 
-        # Run dynamic rule generation orchestrator
+        # BEGIN NEW: Branch based on rule generation mode
         try:
+            if use_cross_app:
+                # ===================================================================
+                # NEW: CROSS-APP RULE GENERATION MODE
+                # ===================================================================
+                self.logger.info("Using CROSS-APP rule generation mode")
+                self.logger.info("Rules will grant entitlements across multiple apps simultaneously")
+
+                # Import cross-app generator
+                try:
+                    from dynamic_rule_generator_cross_app import (
+                        CrossAppRuleGeneratorConfig,
+                        CrossAppRuleGenerationOrchestrator
+                    )
+                except ImportError:
+                    self.logger.error(
+                        "dynamic_rule_generator_cross_app.py not found. "
+                        "Falling back to per-app coordinated mode."
+                    )
+                    use_cross_app = False
+
+                if use_cross_app:
+                    # Get cross-app specific configuration
+                    num_cross_app_rules = dynamic_config.get('num_cross_app_rules', 10)
+                    if isinstance(num_cross_app_rules, dict):
+                        num_cross_app_rules = num_cross_app_rules.get('value', 10)
+                    num_cross_app_rules = int(num_cross_app_rules)
+
+                    apps_per_rule_min = dynamic_config.get('apps_per_rule_min', 2)
+                    if isinstance(apps_per_rule_min, dict):
+                        apps_per_rule_min = apps_per_rule_min.get('value', 2)
+                    apps_per_rule_min = int(apps_per_rule_min)
+
+                    apps_per_rule_max = dynamic_config.get('apps_per_rule_max', 4)
+                    if isinstance(apps_per_rule_max, dict):
+                        apps_per_rule_max = apps_per_rule_max.get('value', 4)
+                    apps_per_rule_max = int(apps_per_rule_max)
+
+                    # Create cross-app configuration
+                    cross_app_config = CrossAppRuleGeneratorConfig(
+                        num_cross_app_rules=num_cross_app_rules,
+                        apps_per_rule_min=apps_per_rule_min,
+                        apps_per_rule_max=apps_per_rule_max,
+                        confidence_distribution=dynamic_config.get('confidence_distribution', {
+                            'high': 0.40,
+                            'medium': 0.35,
+                            'low': 0.25
+                        }),
+                        confidence_ranges=confidence_ranges if confidence_ranges else None,
+                        support_range=support_range,
+                        cramers_v_range=cramers_v_range,
+                        min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
+                        max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
+                        min_entitlements_per_app=dynamic_config.get('min_entitlements_per_app', 1),
+                        max_entitlements_per_app=dynamic_config.get('max_entitlements_per_app', 4)
+                    )
+
+                    self.logger.info(f"Generating {num_cross_app_rules} cross-app rules")
+                    self.logger.info(f"Apps per rule: {apps_per_rule_min}-{apps_per_rule_max}")
+
+                    # Run cross-app rule generator
+                    orchestrator = CrossAppRuleGenerationOrchestrator(
+                        users_file=self.data_writer.output_dir / 'identities.csv',
+                        apps_config=enabled_apps,
+                        entitlements_dir=self.data_writer.output_dir,
+                        output_file=output_path,
+                        config=cross_app_config,
+                        seed=seed
+                    )
+
+                    orchestrator.run()
+
+                    self.logger.info(f"Cross-app rules successfully generated: {output_path}")
+                    return
+
+            # ===================================================================
+            # ORIGINAL: PER-APP COORDINATED MODE (FALLBACK)
+            # ===================================================================
+            if not use_cross_app:
+                self.logger.info("Using PER-APP coordinated rule generation mode")
+                self.logger.info("Each rule grants entitlements for a single app")
+
+                # Extract coordinate_rules_across_apps
+                coordinate_rules = dynamic_config.get('coordinate_rules_across_apps', False)
+                if isinstance(coordinate_rules, dict):
+                    coordinate_rules = coordinate_rules.get('value', False)
+                coordinate_rules = bool(coordinate_rules)
+
+                # Extract num_unique_feature_patterns
+                num_patterns = dynamic_config.get('num_unique_feature_patterns', None)
+                if isinstance(num_patterns, dict):
+                    num_patterns = num_patterns.get('value', None)
+                if num_patterns is not None:
+                    num_patterns = int(num_patterns)
+
+                rule_gen_config = RuleGeneratorConfig(
+                num_rules_per_app=dynamic_config.get('num_rules_per_app', 5),
+                confidence_distribution=dynamic_config.get('confidence_distribution', {
+                    'high': 0.40,
+                    'medium': 0.35,
+                    'low': 0.25
+                }),
+                confidence_ranges=confidence_ranges if confidence_ranges else None,
+                support_range=support_range,
+                cramers_v_range=cramers_v_range,
+                min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
+                max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
+                min_entitlements_per_rule=dynamic_config.get('min_entitlements_per_rule', 1),
+                max_entitlements_per_rule=dynamic_config.get('max_entitlements_per_rule', 4),
+                coordinate_rules_across_apps=coordinate_rules,
+                num_unique_feature_patterns=num_patterns
+            )
+
+            # Run original per-app rule generation orchestrator
             orchestrator = RuleGenerationOrchestrator(
                 users_file=self.data_writer.output_dir / 'identities.csv',
                 apps_config=enabled_apps,
@@ -2000,7 +2102,7 @@ class SyntheticDataGenerator:
 
             orchestrator.run()
 
-            self.logger.info(f"Dynamic rules successfully generated: {output_path}")
+            self.logger.info(f"Per-app rules successfully generated: {output_path}")
 
         except Exception as e:
             self.logger.error(f"Failed to generate dynamic rules: {e}")
@@ -2009,7 +2111,7 @@ class SyntheticDataGenerator:
 
             # Fall back to using existing rules if available
             self.logger.warning("Falling back to pre-defined rules from rules_directory")
-        # END PATCH 2
+    # END NEW
 # =============================================================================
 # CLI Entry Point
 # =============================================================================

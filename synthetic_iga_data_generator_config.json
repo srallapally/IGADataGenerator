@@ -406,9 +406,39 @@
       "value": true
     },
 
+    "use_cross_app_rules": {
+      "_comment": "Enable cross-app rule generation. If true, rules are generated after identities and entitlements.",
+      "value": true
+    },
+
+     "num_cross_app_rules": {
+      "_comment": "Number of association rules to generate per application",
+       "value": 10
+    },
+
+    "apps_per_rule_min": {
+      "_comment": "",
+      "value": 2
+    },
+
+    "apps_per_rule_max": {
+      "_comment": "",
+      "value": 10
+    },
+
+    "entitlements_per_app_min": {
+      "_comment": "",
+      "value": 3
+    },
+
+    "entitlements_per_app_max": {
+      "_comment": "",
+      "value": 20
+    },
+
     "num_rules_per_app": {
       "_comment": "Number of association rules to generate per application",
-      "value": 6
+      "value": 10
     },
 
     "coordinate_rules_across_apps": {
@@ -418,7 +448,7 @@
 
     "num_unique_feature_patterns": {
        "_comment_num_unique_patterns": "NEW: Number of unique feature patterns to generate (used across all apps)",
-       "value": 6
+       "value": 10
     },
 
     "confidence_distribution": {
