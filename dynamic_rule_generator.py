@@ -274,10 +274,15 @@ class DynamicRuleGenerator:
             # Support must be achievable given population
             max_support = matching_population / total_population
             support_min, support_max = self.config.support_range
-            support = self.rng.uniform(
-                max(support_min, 0.01),
-                min(support_max, max_support * 0.9)  # Leave some room for noise
-            )
+            # Calculate actual achievable support
+            actual_min_support = max(support_min, 0.01)
+            actual_max_support = min(support_max, max_support * 0.9)
+
+            # If range is invalid (min > max), skip this combination
+            if actual_min_support >= actual_max_support:
+                continue  # Try a different feature combination
+
+            support = self.rng.uniform(actual_min_support, actual_max_support)
 
             cramers_v = self.rng.uniform(
                 self.config.cramers_v_range[0],
