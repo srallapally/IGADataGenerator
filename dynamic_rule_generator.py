@@ -394,24 +394,27 @@ class DynamicRuleGenerator:
                 entitlements=selected_ents
             )
 
-            # Step 6: Build rule
+            # Step 6: Build rule in AssociationRule-compatible format
+            # Convert antecedent dict to FEATURE: markers
+            antecedent_markers = [
+                f"FEATURE:{key}={value}"
+                for key, value in antecedent.items()
+            ]
+
             rule = {
                 'rule_id': rule_id,
                 'app_name': app_name,
                 'description': description,
-                'antecedent': antecedent,
-                'consequent': {
-                    'entitlements': entitlement_ids
-                },
-                'strength': {
-                    'confidence': round(confidence, 3),
-                    'support': round(support, 3),
-                    'target_cramers_v': round(cramers_v, 3)
-                },
+                'antecedent_entitlements': antecedent_markers,  # Changed
+                'consequent_entitlements': entitlement_ids,  # Changed
+                'support': round(support, 3),
+                'confidence': round(confidence, 3),
+                'lift': 1.0,  # Default lift value
                 'metadata': {
                     'confidence_bucket': confidence_bucket,
                     'estimated_matching_users': matching_population,
-                    'total_users': total_population
+                    'total_users': total_population,
+                    'target_cramers_v': round(cramers_v, 3)
                 }
             }
 

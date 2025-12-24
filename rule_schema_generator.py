@@ -264,20 +264,24 @@ class RuleSchemaGenerator:
             entitlement_ids = [e['entitlement_id'] for e in selected_ents]
 
             # Create rule
+            antecedent_markers = [
+                f"FEATURE:{key}={value}"
+                for key, value in antecedent.items()
+            ]
+            # Create rule in AssociationRule-compatible format
             rule = {
                 'rule_id': rule_id,
                 'app_name': app_name,
                 'description': self._create_description(antecedent, app_name, selected_ents),
-                'antecedent': antecedent,
-                'consequent': {'entitlements': entitlement_ids},
-                'strength': {
-                    'confidence': round(confidence, 3),
-                    'support': round(support, 3),
-                    'target_cramers_v': round(cramers_v, 3)
-                },
+                'antecedent_entitlements': antecedent_markers,  # Changed from 'antecedent'
+                'consequent_entitlements': entitlement_ids,  # Changed from nested dict
+                'support': round(support, 3),  # Moved from 'strength' dict
+                'confidence': round(confidence, 3),  # Moved from 'strength' dict
+                'lift': 1.0,  # Added default lift value
                 'metadata': {
                     'confidence_bucket': confidence_bucket,
-                    'schema_based': True
+                    'schema_based': True,
+                    'target_cramers_v': round(cramers_v, 3)  # Moved from 'strength' dict
                 }
             }
 
@@ -439,23 +443,27 @@ class RuleSchemaGenerator:
                 entitlements=selected_ents
             )
 
-            # Build rule
+            antecedent_markers = [
+                f"FEATURE:{key}={value}"
+                for key, value in pattern.items()
+            ]
+
+            # Build rule in AssociationRule-compatible format
             rule = {
                 'rule_id': rule_id,
                 'app_name': app_name,
                 'description': description,
-                'antecedent': pattern,
-                'consequent': {'entitlements': entitlement_ids},
-                'strength': {
-                    'confidence': round(confidence, 3),
-                    'support': round(support, 3),
-                    'target_cramers_v': round(cramers_v, 3)
-                },
+                'antecedent_entitlements': antecedent_markers,  # Changed from 'antecedent'
+                'consequent_entitlements': entitlement_ids,  # Changed from nested dict
+                'support': round(support, 3),  # Moved from 'strength' dict
+                'confidence': round(confidence, 3),  # Moved from 'strength' dict
+                'lift': 1.0,  # Added default lift value
                 'metadata': {
                     'confidence_bucket': confidence_bucket,
                     'expected_support': round(expected_support, 4),
                     'coordinated': True,  # Flag to indicate shared pattern
-                    'schema_based': True
+                    'schema_based': True,
+                    'target_cramers_v': round(cramers_v, 3)  # Moved from 'strength' dict
                 }
             }
 
