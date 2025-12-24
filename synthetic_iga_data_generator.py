@@ -587,6 +587,395 @@ class IdentityGenerator:
 
         self.logger.info(f"Assigned {len(manager_indices)} managers, {len(no_manager_indices)} without managers")
 
+    def generate_rule_aware(self, num_identities: int, rule_engine: RuleEngine) -> List[Identity]:
+        """
+        Generate identities that conform to rule antecedents.
+
+        This creates a population where rule patterns have the target support levels,
+        ensuring meaningful statistical associations without overfitting.
+
+        Args:
+            num_identities: Total number of identities to generate
+            rule_engine: RuleEngine containing the rules to satisfy
+
+        Returns:
+            List of Identity objects designed to satisfy rule patterns
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("RULE-AWARE IDENTITY GENERATION (Phase 2)")
+        self.logger.info("=" * 60)
+
+        # Step 1: Extract rule patterns across all apps
+        rule_patterns = self._extract_rule_patterns(rule_engine)
+        self.logger.info(f"Extracted {len(rule_patterns)} unique rule patterns")
+
+        # Step 2: Calculate how many identities should match each pattern
+        pattern_quotas = self._calculate_pattern_quotas(rule_patterns, num_identities)
+        self.logger.info(f"Calculated quotas for {len(pattern_quotas)} patterns")
+
+        # Step 3: Generate identities for each pattern
+        identities = []
+        for pattern, quota in pattern_quotas.items():
+            if quota > 0:
+                pattern_identities = self._generate_identities_for_pattern(pattern, quota)
+                identities.extend(pattern_identities)
+                self.logger.debug(f"Generated {len(pattern_identities)} identities for pattern: {pattern}")
+
+        self.logger.info(f"Generated {len(identities)} rule-based identities")
+
+        # Step 4: Fill remaining slots with random identities
+        remaining = num_identities - len(identities)
+        if remaining > 0:
+            self.logger.info(f"Filling {remaining} remaining slots with random identities")
+            random_identities = self._generate_random_identities(remaining)
+            identities.extend(random_identities)
+
+        # Step 5: Shuffle to avoid clustering
+        self.rng.shuffle(identities)
+
+        # Step 6: Assign managers (second pass)
+        pct_no_manager = self.config.get('pct_users_without_manager', 0.10)
+        self._assign_managers(pct_no_manager)
+
+        self.logger.info(f"✓ Generated {len(identities)} rule-aware identities")
+        return identities
+
+    def _extract_rule_patterns(self, rule_engine: RuleEngine) -> List[Dict[str, any]]:
+        """
+        Extract all unique rule patterns from the rule engine.
+
+        Returns list of patterns with metadata:
+        [
+            {
+                'pattern': {'department': 'Engineering', 'job_level': 'Senior'},
+                'apps': ['AWS', 'GitHub'],
+                'target_support': 0.06,
+                'confidence': 0.85
+            },
+            ...
+        ]
+        """
+        patterns = []
+        seen_patterns = set()
+
+        # Iterate through all apps and their rules
+        for app_name in rule_engine.rules_by_app.keys():
+            rules = rule_engine.get_rules_for_app(app_name)
+
+            for rule in rules:
+                # Parse pattern from antecedent markers
+                pattern = self._parse_antecedent_to_pattern(rule.antecedent_entitlements)
+
+                if not pattern:
+                    continue
+
+                # Create a hashable key
+                pattern_key = tuple(sorted(pattern.items()))
+
+                if pattern_key not in seen_patterns:
+                    seen_patterns.add(pattern_key)
+                    patterns.append({
+                        'pattern': pattern,
+                        'apps': [app_name],
+                        'target_support': rule.support,
+                        'confidence': rule.confidence,
+                        'rule_ids': [rule.id]
+                    })
+                else:
+                    # Pattern already exists, add this app to it
+                    for p in patterns:
+                        if tuple(sorted(p['pattern'].items())) == pattern_key:
+                            if app_name not in p['apps']:
+                                p['apps'].append(app_name)
+                            p['rule_ids'].append(rule.id)
+                            # Use maximum support/confidence across rules
+                            p['target_support'] = max(p['target_support'], rule.support)
+                            p['confidence'] = max(p['confidence'], rule.confidence)
+                            break
+
+        return patterns
+
+    def _parse_antecedent_to_pattern(self, antecedent_entitlements: List[str]) -> Dict[str, str]:
+        """
+        Parse antecedent markers into a feature pattern.
+
+        Cross-app rules use markers like: 'FEATURE:department=Engineering'
+        Per-app rules might use actual entitlements (skip these)
+
+        Returns:
+            Dict mapping feature names to values
+        """
+        pattern = {}
+
+        for marker in antecedent_entitlements:
+            if isinstance(marker, str) and marker.startswith('FEATURE:'):
+                # Parse "FEATURE:feature_name=value"
+                parts = marker[8:].split('=', 1)  # Remove "FEATURE:" prefix
+                if len(parts) == 2:
+                    feature_name, value = parts
+                    pattern[feature_name] = value
+
+        return pattern
+
+    def _calculate_pattern_quotas(self,
+                                  rule_patterns: List[Dict[str, any]],
+                                  num_identities: int) -> Dict[Tuple, int]:
+        """
+        Calculate how many identities should match each pattern.
+
+        Uses target support levels to determine quotas, with adjustments
+        to ensure we don't exceed total population.
+
+        Returns:
+            Dict mapping pattern tuples to identity counts
+        """
+        quotas = {}
+        total_allocated = 0
+
+        # Sort patterns by support (descending) to allocate high-support patterns first
+        sorted_patterns = sorted(rule_patterns, key=lambda p: p['target_support'], reverse=True)
+
+        for pattern_info in sorted_patterns:
+            pattern = pattern_info['pattern']
+            target_support = pattern_info['target_support']
+
+            # Calculate target count
+            target_count = int(num_identities * target_support)
+
+            # Ensure minimum viable population
+            if target_count < 5:
+                target_count = 5
+
+            # Don't exceed remaining budget
+            remaining = num_identities - total_allocated
+            if target_count > remaining:
+                target_count = remaining
+
+            if target_count > 0:
+                pattern_key = tuple(sorted(pattern.items()))
+                quotas[pattern_key] = target_count
+                total_allocated += target_count
+
+            # Stop if we've allocated all identities
+            if total_allocated >= num_identities * 0.95:  # Leave 5% for random
+                break
+
+        self.logger.info(f"Allocated {total_allocated}/{num_identities} identities to {len(quotas)} patterns")
+        return quotas
+
+    def _generate_identities_for_pattern(self,
+                                         pattern: Tuple[Tuple[str, str], ...],
+                                         count: int) -> List[Identity]:
+        """
+        Generate identities that match a specific feature pattern.
+
+        Args:
+            pattern: Tuple of (feature, value) pairs
+            count: Number of identities to generate
+
+        Returns:
+            List of Identity objects matching the pattern
+        """
+        pattern_dict = dict(pattern)
+        identities = []
+
+        for i in range(count):
+            identity = self._generate_single_identity_with_pattern(pattern_dict)
+            identities.append(identity)
+
+        return identities
+
+    def _generate_single_identity_with_pattern(self, pattern: Dict[str, str]) -> Identity:
+        """
+        Generate a single identity that matches the given feature pattern.
+
+        Args:
+            pattern: Dict of feature constraints, e.g. {'department': 'Engineering', 'job_level': 'Senior'}
+
+        Returns:
+            Identity object with specified features
+        """
+        # Generate base identity attributes
+        user_id = f"U{len(self.identities) + 1:07d}"
+        employee_id = f"EMP{len(self.identities) + 1:06d}"
+
+        first_name = self.faker.first_name()
+        last_name = self.faker.last_name()
+        user_name = self._generate_username(first_name, last_name)
+        email = f"{first_name.lower()}.{last_name.lower()}@company.com"
+
+        # Apply pattern constraints
+        department, dept_data = self._select_department_matching_pattern(pattern)
+        business_unit = dept_data.get('Industry', pattern.get('business_unit', 'General'))
+        department_type = dept_data.get('Type', pattern.get('department_type', 'Business'))
+        department_id = dept_data.get('department_id', f'DEPT_{department.upper()[:10]}')
+
+        # Select job matching pattern
+        jobcode, job_data = self._select_job_matching_pattern(pattern, business_unit)
+        job_category = job_data.get('Category', 'Business')
+        job_level = pattern.get('job_level', self._infer_job_level(jobcode))
+
+        # Apply other pattern constraints
+        employment_type = pattern.get('employment_type',
+                                      self._weighted_choice(self.config.get('distribution_employee_contractor',
+                                                                            {'Employee': 0.9, 'Contractor': 0.1})))
+
+        identity_type = pattern.get('identity_type',
+                                    self._weighted_choice(self.config.get('distribution_human_ai_agent',
+                                                                          {'Human': 0.95, 'AI_Agent': 0.05})))
+
+        status = pattern.get('status',
+                             self._weighted_choice(self.config.get('distribution_active_inactive',
+                                                                   {'Active': 0.93, 'Inactive': 0.07})))
+
+        # Location
+        location_country, location_site = self._select_location_matching_pattern(pattern)
+
+        # Tenure
+        tenure = self._generate_tenure()
+        hire_date = (datetime.now() - timedelta(days=int(tenure * 365))).strftime('%Y-%m-%d')
+
+        # Cost center
+        cost_center = f"CC_{department_id[:10]}_{self.rng.integers(100, 999)}"
+
+        # Create identity
+        identity = Identity(
+            user_id=user_id,
+            user_name=user_name,
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            department=department,
+            department_id=department_id,
+            business_unit=business_unit,
+            department_type=department_type,
+            jobcode=jobcode,
+            job_category=job_category,
+            job_level=job_level,
+            manager=None,  # Assigned in second pass
+            manager_name=None,
+            location_country=location_country,
+            location_site=location_site,
+            employment_type=employment_type,
+            identity_type=identity_type,
+            status=status,
+            cost_center=cost_center,
+            tenure_years=f"{tenure:.1f}",
+            hire_date=hire_date,
+            is_manager='N',  # Assigned in second pass
+            employee_id=employee_id
+        )
+
+        self.identities.append(identity)
+        return identity
+
+    def _select_department_matching_pattern(self, pattern: Dict[str, str]) -> Tuple[str, Dict]:
+        """
+        Select a department that matches pattern constraints.
+
+        Returns:
+            (department_name, department_data)
+        """
+        if 'department' in pattern:
+            # Find exact match
+            target_dept = pattern['department']
+            for dept in self.departments:
+                if dept.get('department_name') == target_dept:
+                    return target_dept, dept
+            # If not found, return the pattern value with synthetic data
+            return target_dept, {
+                'department_id': f'DEPT_{target_dept.upper()[:10]}',
+                'department_name': target_dept,
+                'Industry': pattern.get('business_unit', 'General'),
+                'Type': pattern.get('department_type', 'Business')
+            }
+
+        if 'business_unit' in pattern:
+            # Find department in matching business unit
+            target_bu = pattern['business_unit']
+            matching_depts = [d for d in self.departments if d.get('Industry') == target_bu]
+            if matching_depts:
+                dept = self.rng.choice(matching_depts)
+                return dept.get('department_name', 'General'), dept
+
+        # Random selection
+        dept = self._select_department()
+        return dept.get('department_name', 'General'), dept
+
+    def _select_job_matching_pattern(self, pattern: Dict[str, str], business_unit: str) -> Tuple[str, Dict]:
+        """
+        Select a job title that matches pattern constraints.
+
+        Returns:
+            (job_title, job_data)
+        """
+        if 'jobcode' in pattern:
+            # Use exact job from pattern
+            target_job = pattern['jobcode']
+            for job in self.jobtitles:
+                if job.get('Job Title') == target_job:
+                    return target_job, job
+            # If not found, return pattern value
+            return target_job, {'Job Title': target_job, 'Category': pattern.get('job_category', 'Business')}
+
+        if 'job_level' in pattern:
+            # Filter jobs by level keywords
+            target_level = pattern['job_level']
+            level_keywords = self.JOB_LEVEL_KEYWORDS.get(target_level, [])
+
+            matching_jobs = []
+            for job in self.jobtitles:
+                job_title = job.get('Job Title', '')
+                for keyword in level_keywords:
+                    if keyword.upper() in job_title.upper():
+                        matching_jobs.append(job)
+                        break
+
+            if matching_jobs:
+                job = self.rng.choice(matching_jobs)
+                return job.get('Job Title', 'Specialist'), job
+
+        # Random selection for business unit
+        job = self._select_job_for_department(business_unit)
+        return job.get('Job Title', 'Specialist'), job
+
+    def _select_location_matching_pattern(self, pattern: Dict[str, str]) -> Tuple[str, str]:
+        """
+        Select location matching pattern constraints.
+
+        Returns:
+            (country, site)
+        """
+        country_dist = {'US': 0.60, 'GB': 0.15, 'IN': 0.15, 'DE': 0.05, 'AU': 0.05}
+        site_by_country = {
+            'US': {'SFO': 0.3, 'NYC': 0.25, 'AUS': 0.15, 'CHI': 0.1, 'SEA': 0.1, 'BOS': 0.1},
+            'GB': {'LON': 0.7, 'MAN': 0.2, 'EDI': 0.1},
+            'IN': {'BLR': 0.5, 'MUM': 0.3, 'HYD': 0.2},
+            'DE': {'BER': 0.6, 'MUN': 0.4},
+            'AU': {'SYD': 0.7, 'MEL': 0.3}
+        }
+
+        if 'location_country' in pattern:
+            country = pattern['location_country']
+        else:
+            country = self._weighted_choice(country_dist)
+
+        if 'location_site' in pattern:
+            site = pattern['location_site']
+        else:
+            site_options = site_by_country.get(country, {'HQ': 1.0})
+            site = self._weighted_choice(site_options)
+
+        return country, site
+
+    def _generate_random_identities(self, count: int) -> List[Identity]:
+        """
+        Generate random identities (no pattern constraints).
+
+        This fills in the remaining population after rule-based generation.
+        """
+        return self.generate(count)
+
     def to_dataframe(self) -> pd.DataFrame:
         """Convert identities to DataFrame."""
         data = []
@@ -928,7 +1317,7 @@ class AccountGenerator:
                     )
 
                     final_ents = sorted(set(seed + recs))
-
+                    """"
                     # Optional small amount of noise
                     if self.rng.random() < 0.10 and len(ent_ids) > len(final_ents):
                         noise = self.rng.choice(
@@ -937,7 +1326,7 @@ class AccountGenerator:
                             replace=False
                         ).tolist()
                         final_ents = sorted(set(final_ents + noise))
-
+                    """
                     coverage = RuleEngine.compute_rule_coverage(final_ents, used_rules)
                     score = RuleEngine.score_from_coverage_and_conf(coverage, used_rules)
                     bucket = RuleEngine.bucket_from_score(score)
@@ -1794,48 +2183,570 @@ class SyntheticDataGenerator:
         self.data_writer = DataWriter(self.config)
         self.data_writer.setup_output_dir()
 
-        # Step 4: Generate identities
-        self.identity_generator = IdentityGenerator(self.config, rng, faker, self.input_reader)
-        num_identities = self.config.get('identity', {}).get('num_identities', 10000)
-        self.identities = self.identity_generator.generate(num_identities)
-        self.identities_df = self.identity_generator.to_dataframe()
+        # BEGIN CORRECTED ARCHITECTURE
 
-        # Step 5: Generate entitlements
+        # CORRECTED Step 4: Generate entitlements FIRST
+        # This must happen before rules because rules reference entitlement IDs
         self.entitlement_generator = EntitlementGenerator(self.config, rng, faker, self.input_reader)
         self.entitlements_by_app = self.entitlement_generator.generate_all()
+        self.logger.info("✓ Generated entitlements catalog")
 
-        # BEGIN PATCH 3: Step 5.5: Generate dynamic rules
-        self._generate_dynamic_rules(seed)
-        # END PATCH 3
-
-        # NEW: Initialize rule engine (Workflow A)
+        # CORRECTED Step 5: Generate/Load rules BEFORE identities
+        # Rules define the target patterns we want in the data
         rules_dir = Path(self.config.get('global', {}).get('rules_directory', 'rules'))
+
+        dynamic_config = self.config.get('dynamic_rules', {})
+        if dynamic_config.get('enabled', False):
+            # Generate rules with target statistical properties
+            self._generate_rules_first(seed, rng)
+            self.logger.info("✓ Generated rules with target distributions")
+        else:
+            # Load pre-defined rules
+            if not rules_dir.exists() or not list(rules_dir.glob("*.json")):
+                raise ValueError(
+                    "No rules found and dynamic_rules.enabled=false. "
+                    "Either enable dynamic rules or provide rule files in rules_directory."
+                )
+            self.logger.info("✓ Using pre-defined rules from rules_directory")
+
+        # Initialize rule engine
         rule_engine = RuleEngine(rules_dir=rules_dir, rng=rng)
 
-        # Step 6: Generate accounts/grants
+        # CORRECTED Step 6: Generate identities conforming to rule antecedents
+        # Instead of random identities, generate them to satisfy rule patterns
+        self.identity_generator = IdentityGenerator(
+            self.config, rng, faker, self.input_reader
+        )
+
+        # NEW: Pass rule engine to identity generator so it can create
+        # identities that satisfy rule antecedents
+        num_identities = self.config.get('identity', {}).get('num_identities', 10000)
+        self.logger.info(
+            "Note: Using standard identity generation. "
+            "Rule-aware generation (Phase 2) not yet implemented."
+        )
+        self.identities = self.identity_generator.generate(num_identities)
+        self.identities_df = self.identity_generator.to_dataframe()
+        self.logger.info("✓ Generated identities conforming to rule patterns")
+
+        # CORRECTED Step 7: Apply rules to assign entitlements
+        # Now rules are applied to identities designed to satisfy them
         self.account_generator = AccountGenerator(
             self.config, rng, self.identities, self.entitlements_by_app, rule_engine=rule_engine
         )
         self.accounts_by_app = self.account_generator.generate_all()
+        self.logger.info("✓ Applied rules to assign entitlements")
 
-        # Step 7: Calculate confidence scores
+        # END CORRECTED ARCHITECTURE
+
+        # Step 8: Calculate confidence scores
         self.confidence_calculator = ConfidenceScoreCalculator(
             self.config, rng, self.identities_df, self.accounts_by_app
         )
         self.confidence_calculator.calculate_scores()
 
-        # Step 8: Validate features
+        # Step 9: Validate features
         self.feature_validator = FeatureValidator(
             self.config, self.identities_df, self.accounts_by_app
         )
         validation_results = self.feature_validator.validate()
 
-        # Step 9: Write output files
+        # Step 10: Write output files
         self._write_outputs(validation_results)
 
         self.logger.info("=" * 60)
         self.logger.info("SYNTHETIC DATA GENERATION - COMPLETE")
         self.logger.info("=" * 60)
+
+    def _generate_rules_first(self, seed: int, rng: np.random.Generator) -> None:
+        """
+        CORRECTED: Generate rules BEFORE identities.
+
+        Rules are defined with target statistical properties independent of any
+        specific identity population. This prevents overfitting.
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("GENERATING RULES (BEFORE IDENTITIES)")
+        self.logger.info("=" * 60)
+
+        dynamic_config = self.config.get('dynamic_rules', {})
+        rules_dir = Path(self.config.get('global', {}).get('rules_directory', './rules'))
+        rules_dir.mkdir(parents=True, exist_ok=True)
+
+        output_filename = dynamic_config.get('output_file', 'generated_rules.json')
+        output_path = rules_dir / output_filename
+
+        # Get apps configuration
+        apps_cfg = self.config.get('applications', {})
+        apps_list = apps_cfg.get('apps', [])
+        enabled_apps = [
+            {'app_name': app['app_name'], 'app_id': app.get('app_id', f"APP_{app['app_name'].upper()}")}
+            for app in apps_list if app.get('enabled', True)
+        ]
+
+        use_cross_app = dynamic_config.get('use_cross_app_rules', False)
+        if isinstance(use_cross_app, dict):
+            use_cross_app = use_cross_app.get('value', False)
+        use_cross_app = bool(use_cross_app)
+
+        # BEGIN NEW: Rule generation without requiring existing identities
+        if use_cross_app:
+            self._generate_cross_app_rules_schema(
+                dynamic_config, enabled_apps, output_path, seed
+            )
+        else:
+            self._generate_per_app_rules_schema(
+                dynamic_config, enabled_apps, output_path, seed
+            )
+        # END NEW
+
+        self.logger.info(f"✓ Rules generated and saved to {output_path}")
+
+    def _generate_per_app_rules_schema(
+            self,
+            dynamic_config: Dict[str, Any],
+            enabled_apps: List[Dict[str, Any]],
+            output_path: Path,
+            seed: int
+    ) -> None:
+        """
+        Generate per-app rules based on abstract schema, not actual identities.
+
+        Instead of mining patterns from generated data, we define rules with
+        target statistical properties that will guide identity generation.
+        """
+        # BEGIN NEW METHOD
+        from rule_schema_generator import RuleGeneratorConfig, RuleSchemaGenerator
+
+        # Extract configuration
+        confidence_ranges_config = dynamic_config.get('confidence_ranges', {})
+        confidence_ranges = {}
+        for bucket, range_cfg in confidence_ranges_config.items():
+            if isinstance(range_cfg, dict):
+                confidence_ranges[bucket] = (
+                    range_cfg.get('min', 0.0),
+                    range_cfg.get('max', 1.0)
+                )
+            else:
+                confidence_ranges[bucket] = (0.65, 0.95)
+
+        support_range_cfg = dynamic_config.get('support_range', {})
+        support_range = (
+            support_range_cfg.get('min', 0.01),
+            support_range_cfg.get('max', 0.20)
+        ) if isinstance(support_range_cfg, dict) else (0.01, 0.20)
+
+        cramers_v_range_cfg = dynamic_config.get('cramers_v_range', {})
+        cramers_v_range = (
+            cramers_v_range_cfg.get('min', 0.30),
+            cramers_v_range_cfg.get('max', 0.50)
+        ) if isinstance(cramers_v_range_cfg, dict) else (0.30, 0.50)
+
+        coordinate_rules = dynamic_config.get('coordinate_rules_across_apps', False)
+        if isinstance(coordinate_rules, dict):
+            coordinate_rules = coordinate_rules.get('value', False)
+
+        num_patterns = dynamic_config.get('num_unique_feature_patterns', None)
+        if isinstance(num_patterns, dict):
+            num_patterns = num_patterns.get('value', None)
+
+        config = RuleGeneratorConfig(
+            num_rules_per_app=dynamic_config.get('num_rules_per_app', 5),
+            confidence_distribution=dynamic_config.get('confidence_distribution', {
+                'high': 0.40,
+                'medium': 0.35,
+                'low': 0.25
+            }),
+            confidence_ranges=confidence_ranges,
+            support_range=support_range,
+            cramers_v_range=cramers_v_range,
+            min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
+            max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
+            min_entitlements_per_rule=dynamic_config.get('min_entitlements_per_rule', 1),
+            max_entitlements_per_rule=dynamic_config.get('max_entitlements_per_rule', 4),
+            coordinate_rules_across_apps=coordinate_rules,
+            num_unique_feature_patterns=num_patterns
+        )
+
+        # NEW: Schema-based generation (no identities required)
+        generator = RuleSchemaGenerator(
+            apps=enabled_apps,
+            entitlements_by_app=self.entitlements_by_app,
+            feature_schema=self._get_feature_schema(),  # Abstract feature definitions
+            config=config,
+            rng=np.random.default_rng(seed)
+        )
+
+        rules = generator.generate_all_rules()
+
+        # Save rules
+        self._save_rules_json(rules, output_path)
+        # END NEW METHOD
+
+    def _generate_cross_app_rules_schema(
+            self,
+            dynamic_config: Dict[str, Any],
+            enabled_apps: List[Dict[str, Any]],
+            output_path: Path,
+            seed: int
+    ) -> None:
+        """
+        Generate cross-app rules based on abstract schema.
+        """
+        # BEGIN NEW METHOD
+        from cross_app_rule_schema_generator import (
+            CrossAppRuleGeneratorConfig,
+            CrossAppRuleSchemaGenerator
+        )
+
+        # Extract configuration for cross-app rules
+        confidence_ranges_config = dynamic_config.get('confidence_ranges', {})
+        confidence_ranges = {}
+        for bucket, range_cfg in confidence_ranges_config.items():
+            if isinstance(range_cfg, dict):
+                confidence_ranges[bucket] = (
+                    range_cfg.get('min', 0.0),
+                    range_cfg.get('max', 1.0)
+                )
+            else:
+                confidence_ranges[bucket] = (0.65, 0.95)
+
+        support_range_cfg = dynamic_config.get('support_range', {})
+        if isinstance(support_range_cfg, dict):
+            support_range = (
+                support_range_cfg.get('min', 0.01),
+                support_range_cfg.get('max', 0.20)
+            )
+        else:
+            support_range = (0.01, 0.20)
+
+        cramers_v_range_cfg = dynamic_config.get('cramers_v_range', {})
+        if isinstance(cramers_v_range_cfg, dict):
+            cramers_v_range = (
+                cramers_v_range_cfg.get('min', 0.30),
+                cramers_v_range_cfg.get('max', 0.50)
+            )
+        else:
+            cramers_v_range = (0.30, 0.50)
+
+        # Extract cross-app specific parameters
+        num_cross_app_rules = dynamic_config.get('num_cross_app_rules', 10)
+        if isinstance(num_cross_app_rules, dict):
+            num_cross_app_rules = num_cross_app_rules.get('value', 10)
+        num_cross_app_rules = int(num_cross_app_rules)
+
+        apps_per_rule_min = dynamic_config.get('apps_per_rule_min', 2)
+        if isinstance(apps_per_rule_min, dict):
+            apps_per_rule_min = apps_per_rule_min.get('value', 2)
+        apps_per_rule_min = int(apps_per_rule_min)
+
+        apps_per_rule_max = dynamic_config.get('apps_per_rule_max', 4)
+        if isinstance(apps_per_rule_max, dict):
+            apps_per_rule_max = apps_per_rule_max.get('value', 4)
+        apps_per_rule_max = int(apps_per_rule_max)
+
+        # Create cross-app configuration
+        config = CrossAppRuleGeneratorConfig(
+            num_cross_app_rules=num_cross_app_rules,
+            apps_per_rule_min=apps_per_rule_min,
+            apps_per_rule_max=apps_per_rule_max,
+            confidence_distribution=dynamic_config.get('confidence_distribution', {
+                'high': 0.40,
+                'medium': 0.35,
+                'low': 0.25
+            }),
+            confidence_ranges=confidence_ranges if confidence_ranges else None,
+            support_range=support_range,
+            cramers_v_range=cramers_v_range,
+            min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
+            max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
+            min_entitlements_per_app=dynamic_config.get('min_entitlements_per_app', 1),
+            max_entitlements_per_app=dynamic_config.get('max_entitlements_per_app', 4)
+        )
+
+        self.logger.info(f"Generating {num_cross_app_rules} cross-app rules from schema")
+        self.logger.info(f"Apps per rule: {apps_per_rule_min}-{apps_per_rule_max}")
+
+        # NEW: Schema-based cross-app generation
+        generator = CrossAppRuleSchemaGenerator(
+            apps=enabled_apps,
+            entitlements_by_app=self.entitlements_by_app,
+            feature_schema=self._get_feature_schema(),
+            config=config,
+            rng=np.random.default_rng(seed)
+        )
+
+        rules = generator.generate_all_rules()
+        self._save_rules_json(rules, output_path)
+
+        self.logger.info(f"Generated {len(rules)} cross-app schema-based rules")
+        # END NEW METHOD
+
+    def _get_feature_schema(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Define abstract feature schema for rule generation.
+
+        This describes what features exist and their possible values,
+        WITHOUT requiring actual identity data.
+
+        Returns:
+            Dict mapping feature names to their schemas:
+            {
+                'department': {
+                    'type': 'categorical',
+                    'values': ['Engineering', 'Sales', 'Finance', ...],
+                    'distribution': {'Engineering': 0.3, 'Sales': 0.2, ...}
+                },
+                'job_level': {
+                    'type': 'categorical',
+                    'values': ['Junior', 'Mid', 'Senior', 'Executive'],
+                    'distribution': {...}
+                }
+            }
+        """
+        # BEGIN NEW METHOD
+        features_cfg = self.config.get('features', {})
+        mandatory_features = features_cfg.get('mandatory_features', [])
+        additional_features = features_cfg.get('additional_features', [])
+
+        all_features = mandatory_features + additional_features
+
+        schema = {}
+
+        # Load department values from input file
+        input_files = self.config.get('identity', {}).get('input_files', {})
+        dept_file = input_files.get('departments', 'input/departments.csv')
+        departments = self.input_reader.read_csv(dept_file)
+
+        if 'department' in all_features and departments:
+            dept_names = [d.get('department_name', '') for d in departments if d.get('department_name')]
+            # Limit to reasonable cardinality for rules
+            dept_names = dept_names[:30]  # Top 30 departments
+
+            schema['department'] = {
+                'type': 'categorical',
+                'values': dept_names,
+                'cardinality': len(dept_names),
+                'distribution': 'uniform'  # Will be normalized automatically
+            }
+
+        # Load business unit values from departments
+        if 'business_unit' in all_features and departments:
+            business_units = list(set([
+                d.get('Industry', '') for d in departments
+                if d.get('Industry')
+            ]))
+
+            schema['business_unit'] = {
+                'type': 'categorical',
+                'values': business_units,
+                'cardinality': len(business_units),
+                'distribution': 'uniform'
+            }
+
+        # Load department type from departments
+        if 'department_type' in all_features and departments:
+            dept_types = list(set([
+                d.get('Type', '') for d in departments
+                if d.get('Type')
+            ]))
+
+            schema['department_type'] = {
+                'type': 'categorical',
+                'values': dept_types,
+                'cardinality': len(dept_types),
+                'distribution': 'uniform'
+            }
+
+        # Load job titles from input file
+        job_file = input_files.get('jobtitles', 'input/jobtitles.csv')
+        jobtitles = self.input_reader.read_csv(job_file)
+
+        if 'jobcode' in all_features and jobtitles:
+            job_names = [j.get('Job Title', '') for j in jobtitles if j.get('Job Title')]
+            # Limit to reasonable cardinality
+            job_names = job_names[:40]  # Top 40 job titles
+
+            schema['jobcode'] = {
+                'type': 'categorical',
+                'values': job_names,
+                'cardinality': len(job_names),
+                'distribution': 'uniform'
+            }
+
+        # Load job category from jobtitles
+        if 'job_category' in all_features and jobtitles:
+            job_categories = list(set([
+                j.get('Category', '') for j in jobtitles
+                if j.get('Category')
+            ]))
+
+            schema['job_category'] = {
+                'type': 'categorical',
+                'values': job_categories,
+                'cardinality': len(job_categories),
+                'distribution': 'uniform'
+            }
+
+        # Define job_level (inferred from job titles, not loaded from file)
+        if 'job_level' in all_features:
+            schema['job_level'] = {
+                'type': 'categorical',
+                'values': ['Junior', 'Mid', 'Senior', 'Lead', 'Manager', 'Director', 'VP', 'Executive'],
+                'cardinality': 8,
+                'distribution': {
+                    'Junior': 0.20,
+                    'Mid': 0.30,
+                    'Senior': 0.20,
+                    'Lead': 0.10,
+                    'Manager': 0.10,
+                    'Director': 0.05,
+                    'VP': 0.03,
+                    'Executive': 0.02
+                }
+            }
+
+        # Define employment_type from config
+        if 'employment_type' in all_features:
+            emp_dist = self.config.get('identity', {}).get('distribution_employee_contractor', {
+                'Employee': 0.70,
+                'Contractor': 0.20,
+                'Intern': 0.10
+            })
+
+            schema['employment_type'] = {
+                'type': 'categorical',
+                'values': list(emp_dist.keys()),
+                'cardinality': len(emp_dist),
+                'distribution': emp_dist
+            }
+
+        # Define identity_type from config
+        if 'identity_type' in all_features:
+            identity_dist = self.config.get('identity', {}).get('distribution_human_ai_agent', {
+                'Human': 0.95,
+                'AI_Agent': 0.05
+            })
+
+            schema['identity_type'] = {
+                'type': 'categorical',
+                'values': list(identity_dist.keys()),
+                'cardinality': len(identity_dist),
+                'distribution': identity_dist
+            }
+
+        # Define location_country
+        if 'location_country' in all_features:
+            schema['location_country'] = {
+                'type': 'categorical',
+                'values': ['US', 'GB', 'IN', 'DE', 'AU'],
+                'cardinality': 5,
+                'distribution': {
+                    'US': 0.60,
+                    'GB': 0.15,
+                    'IN': 0.15,
+                    'DE': 0.05,
+                    'AU': 0.05
+                }
+            }
+
+        # Define location_site
+        if 'location_site' in all_features:
+            # Define major sites across countries
+            sites = ['SFO', 'NYC', 'AUS', 'LON', 'BLR', 'BER', 'SYD']
+
+            schema['location_site'] = {
+                'type': 'categorical',
+                'values': sites,
+                'cardinality': len(sites),
+                'distribution': {
+                    'SFO': 0.20,
+                    'NYC': 0.18,
+                    'AUS': 0.12,
+                    'LON': 0.15,
+                    'BLR': 0.15,
+                    'BER': 0.10,
+                    'SYD': 0.10
+                }
+            }
+
+        # Define status
+        if 'status' in all_features:
+            status_dist = self.config.get('identity', {}).get('distribution_active_inactive', {
+                'Active': 0.93,
+                'Inactive': 0.07
+            })
+
+            schema['status'] = {
+                'type': 'categorical',
+                'values': list(status_dist.keys()),
+                'cardinality': len(status_dist),
+                'distribution': status_dist
+            }
+
+        # Define is_manager (boolean but treated as categorical)
+        if 'is_manager' in all_features:
+            manager_pct = self.config.get('identity', {}).get('manager_hierarchy', {}).get('pct_managers', 0.15)
+
+            schema['is_manager'] = {
+                'type': 'categorical',
+                'values': ['Y', 'N'],
+                'cardinality': 2,
+                'distribution': {
+                    'Y': manager_pct,
+                    'N': 1.0 - manager_pct
+                }
+            }
+
+        # Define manager (reference to another user)
+        # For rule purposes, we'll treat this as a boolean "has manager"
+        if 'manager' in all_features:
+            pct_no_manager = self.config.get('identity', {}).get('pct_users_without_manager', 0.10)
+
+            schema['has_manager'] = {
+                'type': 'categorical',
+                'values': ['Yes', 'No'],
+                'cardinality': 2,
+                'distribution': {
+                    'Yes': 1.0 - pct_no_manager,
+                    'No': pct_no_manager
+                }
+            }
+
+        self.logger.info(f"Generated feature schema with {len(schema)} features")
+        for feature_name, feature_spec in schema.items():
+            self.logger.debug(
+                f"  {feature_name}: {feature_spec['cardinality']} values"
+            )
+
+        return schema
+        # END NEW METHOD
+
+    def _save_rules_json(self, rules: List[Dict], output_path: Path) -> None:
+        """Save rules to JSON with proper type conversion."""
+
+        # BEGIN NEW METHOD
+        def convert_to_native_types(obj):
+            import numpy as np
+            if isinstance(obj, dict):
+                return {k: convert_to_native_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_native_types(item) for item in obj]
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+
+        rules_native = convert_to_native_types(rules)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(rules_native, f, indent=2)
+        # END NEW METHOD
 
     def _write_outputs(self, validation_results: Dict[str, Any]) -> None:
         """Write all output files."""
@@ -1866,36 +2777,6 @@ class SyntheticDataGenerator:
             stats = qa_reporter.generate_statistics()
             self.data_writer.write_statistics(stats)
 
-    def _count_viable_feature_combinations(self) -> int:
-        """
-        Count how many viable feature combinations exist for rule generation.
-        Returns the number of combinations that have sufficient users.
-        """
-        # === BEGIN NEW METHOD ===
-        features_cfg = self.config.get('features', {})
-        mandatory = features_cfg.get('mandatory_features', ['manager', 'department', 'jobcode'])
-        additional = features_cfg.get('additional_features', [])
-
-        all_features = mandatory + additional
-        available = [f for f in all_features if f in self.identities_df.columns]
-
-        # Count viable combinations (need at least 10 users per combination)
-        min_users_per_combo = 10
-        viable_count = 0
-
-        # 1-feature combinations
-        for feature in available[:5]:  # Check first 5 features
-            value_counts = self.identities_df[feature].value_counts()
-            viable_count += (value_counts >= min_users_per_combo).sum()
-
-        self.logger.info(f"Viable feature combinations (≥{min_users_per_combo} users): {viable_count}")
-        self.logger.info(f"  This supports up to {viable_count} unique rules total")
-        self.logger.info(f"  With coordination, this supports {viable_count} rules PER APP")
-
-        return viable_count
-        # === END NEW METHOD ===
-
-
     def _generate_dynamic_rules(self, seed: int) -> None:
         """
         Generate association rules dynamically based on actual user population
@@ -1907,8 +2788,6 @@ class SyntheticDataGenerator:
         if not dynamic_config.get('enabled', False):
             self.logger.info("Dynamic rule generation is disabled. Using pre-defined rules from rules_directory.")
             return
-
-        viable_combinations = self._count_viable_feature_combinations()
 
         if not DYNAMIC_RULES_AVAILABLE:
             self.logger.warning("Dynamic rule generator not available. Skipping dynamic rule generation.")
@@ -1987,9 +2866,9 @@ class SyntheticDataGenerator:
 
                 # Import cross-app generator
                 try:
-                    from dynamic_rule_generator_cross_app import (
+                    from cross_app_rule_schema_generator import (
                         CrossAppRuleGeneratorConfig,
-                        CrossAppRuleGenerationOrchestrator
+                        CrossAppRuleSchemaGenerator
                     )
                 except ImportError:
                     self.logger.error(

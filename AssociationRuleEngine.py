@@ -23,6 +23,12 @@ class RuleEngine:
     """
     Loads pre-mined association rules from JSON and provides
     rule-based entitlement recommendations and coverage scores.
+
+    Supports two rule formats:
+    1. Per-app rules: Standard format with single app_name and entitlement list
+    2. Cross-app rules: Rules that grant entitlements across multiple apps
+
+    Cross-app rules are automatically decomposed into per-app rules during loading.
     """
 
     def __init__(self, rules_dir: Path, rng: np.random.Generator, logger: Optional[logging.Logger] = None):
@@ -40,13 +46,20 @@ class RuleEngine:
     def _load_all_rules(self) -> None:
         """
         Load all *.json rule files in rules_dir.
-        Expected file naming: <app_name>_rules.json
+        Expected file naming: <app_name>_rules.json OR generated_rules.json (cross-app)
+
+        Handles two formats:
+        1. Per-app format: consequent = {"entitlements": [...]}
+        2. Cross-app format: consequent = {"SAP": [...], "AWS": [...]}
+
+        Cross-app rules are decomposed (projected) into separate per-app rules.
         """
         if not self.rules_dir.exists():
             self.logger.warning(f"RuleEngine: rules directory does not exist: {self.rules_dir}")
             return
 
-        for path in self.rules_dir.glob("*_rules.json"):
+        # BEGIN MODIFICATION: Process all .json files, not just *_rules.json
+        for path in self.rules_dir.glob("*.json"):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     raw_rules = json.load(f)
@@ -58,29 +71,192 @@ class RuleEngine:
                 self.logger.warning(f"RuleEngine: rules file {path} is not a list; skipping")
                 continue
 
-            # Infer app_name from file name; JSON also contains app_name per rule
-            app_name = path.name.replace("_rules.json", "")
-            rules: List[AssociationRule] = []
-
+            # Process each rule, detecting and handling format
             for r in raw_rules:
                 try:
-                    rules.append(
-                        AssociationRule(
-                            id=str(r.get("id", "")),
-                            app_name=r.get("app_name", app_name),
-                            antecedent_entitlements=list(r.get("antecedent_entitlements", [])),
-                            consequent_entitlements=list(r.get("consequent_entitlements", [])),
-                            support=float(r.get("support", 0.0)),
-                            confidence=float(r.get("confidence", 0.0)),
-                            lift=float(r.get("lift", 1.0)),
-                        )
-                    )
+                    self._process_rule(r, path)
                 except Exception as e:
-                    self.logger.warning(f"RuleEngine: could not parse rule from {path}: {e}")
+                    self.logger.warning(f"RuleEngine: could not process rule from {path}: {e}")
+        # END MODIFICATION
 
-            if rules:
-                self.rules_by_app[app_name] = rules
-                self.logger.info(f"RuleEngine: loaded {len(rules)} rules for app '{app_name}' from {path}")
+        # Log summary of loaded rules
+        for app_name, rules in self.rules_by_app.items():
+            self.logger.info(f"RuleEngine: loaded {len(rules)} rules for app '{app_name}'")
+
+    def _process_rule(self, rule_dict: Dict[str, Any], source_path: Path) -> None:
+        """
+        Process a single rule, detecting format and normalizing to AssociationRule.
+
+        Detects format by examining the 'consequent' field:
+        - Cross-app: consequent is a dict with app names as keys
+        - Per-app: consequent has 'entitlements' key or is from mined rules
+        """
+        # BEGIN NEW METHOD: Unified rule processing
+        consequent = rule_dict.get("consequent", {})
+
+        # Detect format by examining consequent structure
+        if self._is_cross_app_format(consequent):
+            # Cross-app format: decompose into per-app rules
+            self._load_cross_app_rule(rule_dict)
+        else:
+            # Per-app format: load directly
+            self._load_per_app_rule(rule_dict, source_path)
+        # END NEW METHOD
+
+    def _is_cross_app_format(self, consequent: Any) -> bool:
+        """
+        Determine if a rule is in cross-app format.
+
+        Cross-app format: {"SAP": [...], "AWS": [...]}
+        Per-app format: {"entitlements": [...]} or legacy mined format
+        """
+        # BEGIN NEW METHOD: Format detection
+        if not isinstance(consequent, dict):
+            return False
+
+        # If it has 'entitlements' key, it's per-app format
+        if "entitlements" in consequent:
+            return False
+
+        # If all keys look like app names (not 'entitlements'), it's cross-app
+        # Cross-app rules have app names as keys, each mapping to a list
+        if consequent:
+            # Check if values are lists (expected for cross-app)
+            all_lists = all(isinstance(v, list) for v in consequent.values())
+            # Check if keys don't include standard per-app fields
+            no_standard_fields = "entitlements" not in consequent
+            return all_lists and no_standard_fields
+
+        return False
+        # END NEW METHOD
+
+    def _load_cross_app_rule(self, rule_dict: Dict[str, Any]) -> None:
+        """
+        Decompose a cross-app rule into multiple per-app rules.
+
+        Input format:
+        {
+          "rule_id": "R001",
+          "antecedent": {"department": "Finance", "job_level": "Senior"},
+          "consequent": {
+            "SAP": ["role_1", "role_2"],
+            "AWS": ["policy_1"],
+            "Salesforce": ["license_1"]
+          },
+          "strength": {"confidence": 0.85, "support": 0.12, ...}
+        }
+
+        Creates separate AssociationRule objects for each app (SAP, AWS, Salesforce).
+        Antecedent features are converted to pseudo-entitlement markers for matching.
+        """
+        # BEGIN NEW METHOD: Cross-app rule decomposition
+        base_id = rule_dict.get("rule_id", rule_dict.get("id", "unknown"))
+        antecedent = rule_dict.get("antecedent", {})
+        consequent = rule_dict.get("consequent", {})
+        strength = rule_dict.get("strength", {})
+
+        # Convert antecedent features to pseudo-entitlement markers
+        # Cross-app rules use identity features (department, job_level, etc.)
+        # We encode these as special markers so they can be matched
+        antecedent_markers = []
+        if isinstance(antecedent, dict):
+            antecedent_markers = [f"FEATURE:{k}={v}" for k, v in antecedent.items()]
+        elif isinstance(antecedent, list):
+            # Handle legacy format where antecedent might be a list
+            antecedent_markers = list(antecedent)
+
+        # Extract strength metrics
+        support = float(strength.get("support", 0.0))
+        confidence = float(strength.get("confidence", 0.0))
+        lift = float(strength.get("lift", 1.0))
+
+        # Project rule into per-app rules
+        decomposed_count = 0
+        for app_name, entitlements in consequent.items():
+            if not isinstance(entitlements, list):
+                self.logger.warning(
+                    f"RuleEngine: Skipping app '{app_name}' in rule {base_id} "
+                    f"(entitlements not a list)"
+                )
+                continue
+
+            # Create unique ID for this app's projection
+            projected_id = f"{base_id}_PROJ_{app_name}"
+
+            rule = AssociationRule(
+                id=projected_id,
+                app_name=app_name,
+                antecedent_entitlements=antecedent_markers,
+                consequent_entitlements=entitlements,
+                support=support,
+                confidence=confidence,
+                lift=lift,
+            )
+
+            # Add to the app's rule collection
+            if app_name not in self.rules_by_app:
+                self.rules_by_app[app_name] = []
+            self.rules_by_app[app_name].append(rule)
+            decomposed_count += 1
+
+        if decomposed_count > 0:
+            self.logger.debug(
+                f"RuleEngine: Decomposed cross-app rule {base_id} into "
+                f"{decomposed_count} per-app rules"
+            )
+        # END NEW METHOD
+
+    def _load_per_app_rule(self, rule_dict: Dict[str, Any], source_path: Path) -> None:
+        """
+        Load a standard per-app rule.
+
+        Handles two per-app formats:
+        1. Dynamic generator format: consequent = {"entitlements": [...]}
+        2. Mined rules format: antecedent_entitlements and consequent_entitlements at top level
+        """
+        # BEGIN NEW METHOD: Per-app rule loading
+        # Infer app_name from file name as fallback
+        default_app_name = source_path.name.replace("_rules.json", "").replace(".json", "")
+
+        # Allow rule to specify app_name
+        app_name = rule_dict.get("app_name", default_app_name)
+
+        # Extract rule ID
+        rule_id = str(rule_dict.get("id", rule_dict.get("rule_id", "unknown")))
+
+        # Extract antecedent
+        antecedent_ents = list(rule_dict.get("antecedent_entitlements", []))
+
+        # Extract consequent - handle both formats
+        consequent = rule_dict.get("consequent", {})
+        if isinstance(consequent, dict) and "entitlements" in consequent:
+            # Dynamic generator format
+            consequent_ents = list(consequent.get("entitlements", []))
+        else:
+            # Mined rules format (consequent_entitlements at top level)
+            consequent_ents = list(rule_dict.get("consequent_entitlements", []))
+
+        # Extract strength metrics
+        support = float(rule_dict.get("support", 0.0))
+        confidence = float(rule_dict.get("confidence", 0.0))
+        lift = float(rule_dict.get("lift", 1.0))
+
+        # Create rule
+        rule = AssociationRule(
+            id=rule_id,
+            app_name=app_name,
+            antecedent_entitlements=antecedent_ents,
+            consequent_entitlements=consequent_ents,
+            support=support,
+            confidence=confidence,
+            lift=lift,
+        )
+
+        # Add to app's rule collection
+        if app_name not in self.rules_by_app:
+            self.rules_by_app[app_name] = []
+        self.rules_by_app[app_name].append(rule)
+        # END NEW METHOD
 
     # ------------------------------------------------------------------ #
     # Querying
@@ -93,10 +269,10 @@ class RuleEngine:
         return self.rules_by_app.get(app_name, [])
 
     def suggest_entitlements_for_app(
-        self,
-        app_name: str,
-        current_entitlements: Sequence[str],
-        max_rules: int = 3,
+            self,
+            app_name: str,
+            current_entitlements: Sequence[str],
+            max_rules: int = 3,
     ) -> Tuple[List[str], List[AssociationRule]]:
         """
         Given a set of current entitlements for a user in an app, choose up to
@@ -143,8 +319,8 @@ class RuleEngine:
 
     @staticmethod
     def compute_rule_coverage(
-        entitlements: Sequence[str],
-        rules_used: Sequence[AssociationRule],
+            entitlements: Sequence[str],
+            rules_used: Sequence[AssociationRule],
     ) -> float:
         """
         Compute coverage = fraction of entitlements explained by rule consequents.
@@ -161,8 +337,8 @@ class RuleEngine:
 
     @staticmethod
     def score_from_coverage_and_conf(
-        coverage: float,
-        rules_used: Sequence[AssociationRule],
+            coverage: float,
+            rules_used: Sequence[AssociationRule],
     ) -> float:
         """Turn coverage and average rule confidence into a 0..1 score."""
         if not rules_used:
