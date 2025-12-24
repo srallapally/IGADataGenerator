@@ -36,7 +36,6 @@ def get_access_token(base_url: str, client_id: str, client_secret: str) -> str:
         with urllib.request.urlopen(req) as response:
             if response.status == 200:
                 response_data = json.loads(response.read().decode("utf-8"))
-                print(f"DEBUG: Response: {response_data["access_token"]}")
                 return response_data["access_token"]
             else:
                 raise Exception(
