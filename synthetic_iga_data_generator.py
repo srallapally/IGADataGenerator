@@ -60,7 +60,7 @@ except ImportError as e:
 class ConfigLoader:
     """Loads and validates the configuration file."""
 
-    REQUIRED_APPS = {"AWS", "Salesforce", "ServiceNow", "Epic"}
+    REQUIRED_APPS = {"AWS", "Salesforce", "ServiceNow","SAP"}
 
     def __init__(self, config_path: Path):
         self.config_path = config_path
@@ -287,6 +287,7 @@ class Identity:
     hire_date: str
     is_manager: str
     employee_id: str
+    create_from_rule: bool = False
 
 
 @dataclass
@@ -319,7 +320,21 @@ class Account:
 
 class IdentityGenerator:
     """Generates synthetic user identities."""
+    LOCATION_COUNTRY_DIST = {
+        'US': 0.60,
+        'GB': 0.15,
+        'IN': 0.15,
+        'DE': 0.05,
+        'AU': 0.05
+    }
 
+    LOCATION_SITES_BY_COUNTRY = {
+        'US': {'SFO': 0.3, 'NYC': 0.25, 'AUS': 0.15, 'CHI': 0.1, 'SEA': 0.1, 'BOS': 0.1},
+        'GB': {'LON': 0.7, 'MAN': 0.2, 'EDI': 0.1},
+        'IN': {'BLR': 0.5, 'MUM': 0.3, 'HYD': 0.2},
+        'DE': {'BER': 0.6, 'MUN': 0.4},
+        'AU': {'SYD': 0.7, 'MEL': 0.3}
+    }
     JOB_LEVEL_KEYWORDS = {
         'Executive': ['CEO', 'CFO', 'CIO', 'CTO', 'COO', 'Chief', 'President'],
         'VP': ['VP', 'Vice President'],
@@ -329,6 +344,16 @@ class IdentityGenerator:
         'Senior': ['Senior', 'Sr.', 'Sr '],
         'Mid': ['Specialist', 'Analyst', 'Engineer', 'Coordinator'],
         'Junior': ['Associate', 'Assistant', 'Junior', 'Jr.', 'Entry', 'Intern']
+    }
+    JOB_LEVEL_DISTRIBUTION = {
+        'Junior': 0.20,
+        'Mid': 0.30,
+        'Senior': 0.20,
+        'Lead': 0.10,
+        'Manager': 0.10,
+        'Director': 0.05,
+        'VP': 0.03,
+        'Executive': 0.02
     }
 
     def __init__(self, config: Dict[str, Any], rng: Generator, faker: Faker,
@@ -346,6 +371,22 @@ class IdentityGenerator:
         self.identities: List[Identity] = []
         self.used_usernames: Set[str] = set()
         self.managers: List[str] = []  # List of user_ids who are managers
+        # Allow config overrides for distributions
+        identity_cfg = config.get('identity', {})
+
+        # Override location distribution if provided
+        custom_countries = identity_cfg.get('location_country_distribution')
+        if custom_countries:
+            self.location_country_dist = custom_countries
+        else:
+            self.location_country_dist = self.LOCATION_COUNTRY_DIST
+
+        # Override job level distribution if provided
+        custom_job_levels = identity_cfg.get('job_level_distribution')
+        if custom_job_levels:
+            self.job_level_dist = custom_job_levels
+        else:
+            self.job_level_dist = self.JOB_LEVEL_DISTRIBUTION
 
     def _load_input_data(self) -> None:
         """Load departments and job titles from input files."""
@@ -440,14 +481,8 @@ class IdentityGenerator:
         status_dist = self.config.get('distribution_active_inactive', {'Active': 0.93, 'Inactive': 0.07})
 
         # Location distributions
-        country_dist = {'US': 0.60, 'GB': 0.15, 'IN': 0.15, 'DE': 0.05, 'AU': 0.05}
-        site_by_country = {
-            'US': {'SFO': 0.3, 'NYC': 0.25, 'AUS': 0.15, 'CHI': 0.1, 'SEA': 0.1, 'BOS': 0.1},
-            'GB': {'LON': 0.7, 'MAN': 0.2, 'EDI': 0.1},
-            'IN': {'BLR': 0.5, 'MUM': 0.3, 'HYD': 0.2},
-            'DE': {'BER': 0.6, 'MUN': 0.4},
-            'AU': {'SYD': 0.7, 'MEL': 0.3}
-        }
+        country_dist = self.LOCATION_COUNTRY_DIST
+        site_by_country = self.LOCATION_SITES_BY_COUNTRY
 
         # First pass: generate basic identities
         for i in range(num_identities):
@@ -946,14 +981,8 @@ class IdentityGenerator:
         Returns:
             (country, site)
         """
-        country_dist = {'US': 0.60, 'GB': 0.15, 'IN': 0.15, 'DE': 0.05, 'AU': 0.05}
-        site_by_country = {
-            'US': {'SFO': 0.3, 'NYC': 0.25, 'AUS': 0.15, 'CHI': 0.1, 'SEA': 0.1, 'BOS': 0.1},
-            'GB': {'LON': 0.7, 'MAN': 0.2, 'EDI': 0.1},
-            'IN': {'BLR': 0.5, 'MUM': 0.3, 'HYD': 0.2},
-            'DE': {'BER': 0.6, 'MUN': 0.4},
-            'AU': {'SYD': 0.7, 'MEL': 0.3}
-        }
+        country_dist = self.LOCATION_COUNTRY_DIST
+        site_by_country = self.LOCATION_SITES_BY_COUNTRY
 
         if 'location_country' in pattern:
             country = pattern['location_country']
@@ -1315,16 +1344,6 @@ class AccountGenerator:
                     )
 
                     final_ents = sorted(set(seed + recs))
-                    """"
-                    # Optional small amount of noise
-                    if self.rng.random() < 0.10 and len(ent_ids) > len(final_ents):
-                        noise = self.rng.choice(
-                            [e for e in ent_ids if e not in final_ents],
-                            size=1,
-                            replace=False
-                        ).tolist()
-                        final_ents = sorted(set(final_ents + noise))
-                    """
                     coverage = RuleEngine.compute_rule_coverage(final_ents, used_rules)
                     score = RuleEngine.score_from_coverage_and_conf(coverage, used_rules)
                     bucket = RuleEngine.bucket_from_score(score)
@@ -1742,15 +1761,26 @@ class AccountGenerator:
         self.logger.info(
             f"Pre-determining rule-following users: {pct_modelled:.1%} of {len(self.identities)} users"
         )
-
+        count_forced = 0
+        count_random = 0
         # Single random check per user (not per user-app combination)
         for identity in self.identities:
-            if self.rng.random() < pct_modelled:
+            # Case 1: Rule-Based Identity (Phase 2)
+            # These users were created specifically to match a rule, so they MUST follow it.
+            if getattr(identity, 'created_from_rule', False):
                 self.rule_following_users.add(identity.user_id)
+                count_forced += 1
 
-        self.logger.info(
-            f"✓ {len(self.rule_following_users)} users will follow rules across all apps"
-        )
+            # Case 2: Random Identity (Phase 1/Standard)
+            # Apply random coin flip to decide if they should also follow rules.
+            elif self.rng.random() < pct_modelled:
+                self.rule_following_users.add(identity.user_id)
+                count_random += 1
+
+            self.logger.info(
+                f"✓ Rule-following population: {len(self.rule_following_users)} total "
+                f"({count_forced} forced from schema, {count_random} random selections)"
+            )
 
 
 # =============================================================================
@@ -2635,19 +2665,9 @@ class SyntheticDataGenerator:
         # Define job_level (inferred from job titles, not loaded from file)
         if 'job_level' in all_features:
             schema['job_level'] = {
-                'type': 'categorical',
-                'values': ['Junior', 'Mid', 'Senior', 'Lead', 'Manager', 'Director', 'VP', 'Executive'],
-                'cardinality': 8,
-                'distribution': {
-                    'Junior': 0.20,
-                    'Mid': 0.30,
-                    'Senior': 0.20,
-                    'Lead': 0.10,
-                    'Manager': 0.10,
-                    'Director': 0.05,
-                    'VP': 0.03,
-                    'Executive': 0.02
-                }
+                'values': list(IdentityGenerator.JOB_LEVEL_KEYWORDS.keys()),
+                'cardinality': len(IdentityGenerator.JOB_LEVEL_KEYWORDS),
+                'distribution': IdentityGenerator.JOB_LEVEL_DISTRIBUTION
             }
 
         # Define employment_type from config
@@ -2682,36 +2702,21 @@ class SyntheticDataGenerator:
         # Define location_country
         if 'location_country' in all_features:
             schema['location_country'] = {
-                'type': 'categorical',
-                'values': ['US', 'GB', 'IN', 'DE', 'AU'],
-                'cardinality': 5,
-                'distribution': {
-                    'US': 0.60,
-                    'GB': 0.15,
-                    'IN': 0.15,
-                    'DE': 0.05,
-                    'AU': 0.05
-                }
+                'values': list(IdentityGenerator.LOCATION_COUNTRY_DIST.keys()),
+                'cardinality': len(IdentityGenerator.LOCATION_COUNTRY_DIST),
+                'distribution': IdentityGenerator.LOCATION_COUNTRY_DIST
             }
 
         # Define location_site
         if 'location_site' in all_features:
-            # Define major sites across countries
-            sites = ['SFO', 'NYC', 'AUS', 'LON', 'BLR', 'BER', 'SYD']
+            all_sites = []
+            for sites in IdentityGenerator.LOCATION_SITES_BY_COUNTRY.values():
+                all_sites.extend(sites.keys())
 
             schema['location_site'] = {
-                'type': 'categorical',
-                'values': sites,
-                'cardinality': len(sites),
-                'distribution': {
-                    'SFO': 0.20,
-                    'NYC': 0.18,
-                    'AUS': 0.12,
-                    'LON': 0.15,
-                    'BLR': 0.15,
-                    'BER': 0.10,
-                    'SYD': 0.10
-                }
+                'values': all_sites,
+                'cardinality': len(all_sites),
+                'distribution': 'uniform'  # Complex nested distribution
             }
 
         # Define status

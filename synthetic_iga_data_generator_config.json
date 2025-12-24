@@ -131,7 +131,7 @@
 
     "mandatory_apps": {
       "_comment": "List of mandatory application names.",
-      "value": ["AWS", "Salesforce", "ServiceNow", "Epic","SAP"]
+      "value": ["AWS", "Salesforce", "ServiceNow","SAP"]
     },
 
     "additional_app_pool": {
@@ -248,7 +248,7 @@
           "app_name": "Epic",
           "app_id": "APP_EPIC",
           "_comment": "MANDATORY - Epic EHR - Special case with TWO entitlement attributes",
-          "enabled": true,
+          "enabled": false,
           "num_entitlements": 500,
           "entitlement_attributes": [
             {
