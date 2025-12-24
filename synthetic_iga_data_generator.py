@@ -2225,7 +2225,10 @@ class SyntheticDataGenerator:
             "Note: Using standard identity generation. "
             "Rule-aware generation (Phase 2) not yet implemented."
         )
-        self.identities = self.identity_generator.generate(num_identities)
+        self.identities = self.identity_generator.generate_rule_aware(
+            num_identities=num_identities,
+            rule_engine=rule_engine
+        )
         self.identities_df = self.identity_generator.to_dataframe()
         self.logger.info("✓ Generated identities conforming to rule patterns")
 
