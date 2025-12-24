@@ -815,48 +815,6 @@ class RuleGenerationOrchestrator:
             self.entitlements_by_app[app_name] = entitlements
             self.logger.info(f"Loaded {len(entitlements)} entitlements for {app_name}")
 
-    def _generate_shared_feature_patterns(self, num_patterns: int) -> List[Dict[str, str]]:
-        """
-        Generate a pool of feature patterns that will be shared across all apps.
-        Each pattern will be used to create one rule per app.
-
-        Args:
-            num_patterns: Number of unique feature patterns to generate
-
-        Returns:
-            List of feature pattern dictionaries
-        """
-        # === BEGIN NEW METHOD ===
-        self.logger.info(f"Generating {num_patterns} shared feature patterns...")
-
-        patterns = []
-        attempts = 0
-        max_attempts = num_patterns * 10
-
-        while len(patterns) < num_patterns and attempts < max_attempts:
-            attempts += 1
-
-            # Generate a random feature pattern (reuse existing logic)
-            pattern = self._select_random_feature_combination()
-
-            # Check if pattern is unique and viable
-            if pattern and pattern not in patterns:
-                # Verify sufficient users match this pattern
-                mask = pd.Series([True] * len(self.users_df))
-                for feature, value in pattern.items():
-                    mask &= (self.users_df[feature] == value)
-
-                matching_users = mask.sum()
-
-                # Need at least 10 users for viability
-                if matching_users >= 10:
-                    patterns.append(pattern)
-                    self.logger.info(f"  Pattern {len(patterns)}: {pattern} ({matching_users} users)")
-
-        self.logger.info(f"Generated {len(patterns)} shared feature patterns")
-        return patterns
-        # === END NEW METHOD ===
-
     def _generate_rules(self):
         """Generate rules dynamically."""
         self.logger.info("Generating rules")
