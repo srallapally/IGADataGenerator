@@ -1242,6 +1242,9 @@ class AccountGenerator:
         self.rule_engine = rule_engine
         # Internal: keep rules used per (app_name, user_id) if needed
         self._rules_used: Dict[Tuple[str, str], List[AssociationRule]] = {}
+        # BEGIN FIX: Pre-determine which users follow rules (for cross-app atomicity)
+        self.rule_following_users: Set[str] = set()
+        self._initialize_rule_following_users()
 
     def _get_grant_count(self, app_config: Dict[str, Any], attr_name: str = None) -> int:
         """Get number of entitlements to grant using bell curve distribution."""
@@ -1290,16 +1293,11 @@ class AccountGenerator:
             # Standard account generation
             ent_ids = [e.entitlement_id for e in entitlements]
 
-            # Fraction of users whose assignments will be based on rules
-            pct_modelled = float(
-                self.config.get('confidence', {}).get('pct_modelled_users', 0.93)
-            )
-
             for identity in self.identities:
                 use_rules = (
                         self.rule_engine is not None
                         and self.rule_engine.has_rules(app_name)
-                        and self.rng.random() < pct_modelled
+                        and identity.user_id in self.rule_following_users  # PRE-DETERMINED
                 )
                 if use_rules and ent_ids:
                     # Seed with a small random subset, then expand via rules
@@ -1710,6 +1708,49 @@ class AccountGenerator:
             data.append(row)
 
         return pd.DataFrame(data)
+
+    def _initialize_rule_following_users(self) -> None:
+        """
+        Pre-determine which users will follow rules across ALL apps.
+
+        This ensures cross-app atomicity: if a user follows rules, they do so
+        consistently across all applications. This prevents partial rule application
+        where a user gets entitlements from a cross-app rule in one app but not another.
+
+        Critical for cross-app rules like:
+        "Users with department='Engineering' get entitlements in SAP AND AWS"
+
+        Without this, the random check would happen per app, potentially causing:
+        - User follows rules for SAP (random < 0.93) ✓
+        - User doesn't follow rules for AWS (random > 0.93) ✗
+        Result: Cross-app rule broken
+
+        With this fix:
+        - Decision made once: User follows rules ✓
+        - Applied to SAP: Gets SAP entitlements from rules ✓
+        - Applied to AWS: Gets AWS entitlements from rules ✓
+        Result: Cross-app rule maintains atomicity
+        """
+        if not self.rule_engine:
+            self.logger.info("No rule engine provided - all users will use random assignment")
+            return
+
+        pct_modelled = float(
+            self.config.get('confidence', {}).get('pct_modelled_users', 0.93)
+        )
+
+        self.logger.info(
+            f"Pre-determining rule-following users: {pct_modelled:.1%} of {len(self.identities)} users"
+        )
+
+        # Single random check per user (not per user-app combination)
+        for identity in self.identities:
+            if self.rng.random() < pct_modelled:
+                self.rule_following_users.add(identity.user_id)
+
+        self.logger.info(
+            f"✓ {len(self.rule_following_users)} users will follow rules across all apps"
+        )
 
 
 # =============================================================================
