@@ -27,16 +27,20 @@ from pathlib import Path
 from AssociationRuleEngine import RuleEngine, AssociationRule
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from dynamic_rule_generator_cross_app import CrossAppRuleGenerationOrchestrator
+
 # BEGIN PATCH 1: Import dynamic rule generator
 try:
     from dynamic_rule_generator import (
         RuleGeneratorConfig,
         RuleGenerationOrchestrator
     )
+
     DYNAMIC_RULES_AVAILABLE = True
 except ImportError:
     DYNAMIC_RULES_AVAILABLE = False
     import warnings
+
     warnings.warn("dynamic_rule_generator not available. Dynamic rule generation will be disabled.")
 # END PATCH 1
 
@@ -54,13 +58,41 @@ except ImportError as e:
 
 
 # =============================================================================
+# BEGIN FIX: RuleQuota dataclass for deterministic quota-based assignment
+# =============================================================================
+
+@dataclass
+class RuleQuota:
+    """
+    Tracks quota for a single rule in deterministic assignment.
+
+    Used to ensure mined confidence matches target confidence by selecting
+    exactly freqUnion_target users from those matching the antecedent.
+    """
+    rule_id: str
+    app_name: str
+    antecedent_markers: Set[str]
+    consequent_entitlements: List[str]
+    confidence: float
+    freq: int  # Users matching antecedent
+    freqUnion_target: int  # Users who should get entitlements
+    assigned_users: Set[str] = field(default_factory=set)  # Users already assigned
+    matching_users: List[str] = field(default_factory=list)  # Users matching antecedent
+
+
+# =============================================================================
+# END FIX: RuleQuota dataclass
+# =============================================================================
+
+
+# =============================================================================
 # Configuration Loader
 # =============================================================================
 
 class ConfigLoader:
     """Loads and validates the configuration file."""
 
-    REQUIRED_APPS = {"AWS", "Salesforce", "ServiceNow","SAP"}
+    REQUIRED_APPS = {"AWS", "Salesforce", "ServiceNow", "SAP"}
 
     def __init__(self, config_path: Path):
         self.config_path = config_path
@@ -485,9 +517,17 @@ class IdentityGenerator:
         site_by_country = self.LOCATION_SITES_BY_COUNTRY
 
         # First pass: generate basic identities
+        # BEGIN FIX: Use correct starting index to avoid duplicate user_ids
+        # When called from _generate_random_identities, self.identities may already
+        # have pattern-based identities. We need to start from the next available ID.
+        starting_index = len(self.identities)
+        # END FIX
+
         for i in range(num_identities):
-            user_id = f"U{i + 1:07d}"
-            employee_id = f"EMP{i + 1:06d}"
+            # BEGIN FIX: Offset by starting_index to avoid ID collisions
+            user_id = f"U{starting_index + i + 1:07d}"
+            employee_id = f"EMP{starting_index + i + 1:06d}"
+            # END FIX
 
             first_name = self.faker.first_name()
             last_name = self.faker.last_name()
@@ -761,28 +801,59 @@ class IdentityGenerator:
         Uses target support levels to determine quotas, with adjustments
         to ensure we don't exceed total population.
 
+        TUNED FIX: Weight allocation by (support × √confidence) to balance
+        the distribution. Linear weighting was too aggressive, causing 58% high
+        instead of 35%. Square root dampens the effect while still biasing
+        toward high-confidence rules.
+
         Returns:
             Dict mapping pattern tuples to identity counts
         """
+        # BEGIN TUNED FIX: Use square root of confidence for balanced weighting
         quotas = {}
         total_allocated = 0
 
-        # Sort patterns by support (descending) to allocate high-support patterns first
-        sorted_patterns = sorted(rule_patterns, key=lambda p: p['target_support'], reverse=True)
+        # Calculate weights: support × √confidence
+        # This gives modest preference to high-confidence rules without dominating
+        weighted_patterns = []
+        total_weight = 0.0
+
+        for pattern_info in rule_patterns:
+            # Square root dampens the confidence effect
+            # conf=0.90 → √0.90 = 0.95 (small boost)
+            # conf=0.50 → √0.50 = 0.71 (moderate)
+            # conf=0.20 → √0.20 = 0.45 (not too penalized)
+            confidence_weight = pattern_info['confidence'] ** 0.5
+            weight = pattern_info['target_support'] * confidence_weight
+            total_weight += weight
+            weighted_patterns.append({
+                **pattern_info,
+                'weight': weight,
+                'confidence_weight': confidence_weight
+            })
+
+        # Sort by weight (descending) to allocate high-weight patterns first
+        sorted_patterns = sorted(weighted_patterns, key=lambda p: p['weight'], reverse=True)
+
+        # Allocate proportionally to weights
+        budget = int(num_identities * 0.95)  # Reserve 5% for random
 
         for pattern_info in sorted_patterns:
             pattern = pattern_info['pattern']
-            target_support = pattern_info['target_support']
+            weight = pattern_info['weight']
 
-            # Calculate target count
-            target_count = int(num_identities * target_support)
+            # Proportional allocation based on weight
+            if total_weight > 0:
+                target_count = int(budget * (weight / total_weight))
+            else:
+                target_count = 0
 
             # Ensure minimum viable population
-            if target_count < 5:
-                target_count = 5
+            if target_count < 10:  # Increased from 5 for better statistics
+                target_count = 10
 
             # Don't exceed remaining budget
-            remaining = num_identities - total_allocated
+            remaining = budget - total_allocated
             if target_count > remaining:
                 target_count = remaining
 
@@ -791,12 +862,31 @@ class IdentityGenerator:
                 quotas[pattern_key] = target_count
                 total_allocated += target_count
 
-            # Stop if we've allocated all identities
-            if total_allocated >= num_identities * 0.95:  # Leave 5% for random
+                self.logger.debug(
+                    f"Pattern {pattern}: allocated {target_count} users "
+                    f"(conf={pattern_info['confidence']:.3f}, "
+                    f"√conf={pattern_info['confidence_weight']:.3f}, "
+                    f"support={pattern_info['target_support']:.3f}, "
+                    f"weight={weight:.4f})"
+                )
+
+            # Stop if budget exhausted
+            if total_allocated >= budget:
                 break
 
-        self.logger.info(f"Allocated {total_allocated}/{num_identities} identities to {len(quotas)} patterns")
+        self.logger.info(
+            f"Allocated {total_allocated}/{num_identities} identities to "
+            f"{len(quotas)} patterns (weighted by support × √confidence)"
+        )
         return quotas
+        # END TUNED FIX
+
+        self.logger.info(
+            f"Allocated {total_allocated}/{num_identities} identities to "
+            f"{len(quotas)} patterns (weighted by confidence×support)"
+        )
+        return quotas
+        # END FIX
 
     def _generate_identities_for_pattern(self,
                                          pattern: Tuple[Tuple[str, str], ...],
@@ -1275,6 +1365,164 @@ class AccountGenerator:
         self.rule_following_users: Set[str] = set()
         self._initialize_rule_following_users()
 
+        # Load confidence thresholds from config for bucket classification
+        confidence_cfg = config.get('confidence', {})
+        thresholds = confidence_cfg.get('thresholds', {})
+        self.high_threshold = thresholds.get('high', {}).get('min', 0.70)
+        self.medium_threshold = thresholds.get('medium', {}).get('min', 0.40)
+        self.low_threshold = thresholds.get('low', {}).get('min', 0.01)
+
+    # =========================================================================
+    # BEGIN FIX: Deduplication method to ensure unique accounts per app
+    # =========================================================================
+    def _deduplicate_accounts(self, accounts: List[Account], app_name: str) -> List[Account]:
+        """
+        Remove duplicate accounts based on user_id and user_name.
+
+        Each user should have exactly one account per app. If duplicates exist,
+        keep the first occurrence (which typically has rule-based assignments).
+
+        Args:
+            accounts: List of Account objects (may contain duplicates)
+            app_name: Application name for logging
+
+        Returns:
+            Deduplicated list of Account objects
+        """
+        seen_user_ids = set()
+        seen_user_names = set()
+        deduplicated = []
+        duplicates_removed = 0
+
+        for account in accounts:
+            # Check both user_id and user_name for uniqueness
+            if account.user_id in seen_user_ids or account.user_name in seen_user_names:
+                duplicates_removed += 1
+                continue
+
+            seen_user_ids.add(account.user_id)
+            seen_user_names.add(account.user_name)
+            deduplicated.append(account)
+
+        if duplicates_removed > 0:
+            self.logger.warning(
+                f"{app_name}: Removed {duplicates_removed} duplicate accounts. "
+                f"Reduced from {len(accounts)} to {len(deduplicated)} accounts."
+            )
+
+        return deduplicated
+
+    # =========================================================================
+    # END FIX: Deduplication method
+    # =========================================================================
+
+    def _bucket_from_score(self, score: Optional[float]) -> str:
+        """
+        Map numeric confidence score to bucket using config-based thresholds.
+        Uses confidence.thresholds from config instead of hardcoded values.
+        """
+        if score is None:
+            return "None"
+        if score >= self.high_threshold:
+            return "High"
+        if score >= self.medium_threshold:
+            return "Medium"
+        if score >= self.low_threshold:
+            return "Low"
+        return "Low"
+
+    def _apply_rules_probabilistically(
+            self,
+            app_name: str,
+            user_identity: Dict[str, str],
+            identity: 'Identity'
+    ) -> Tuple[List[str], Optional[float], Optional[str]]:
+        """
+        Apply rules probabilistically based on their confidence values.
+
+        This implements the production analytics methodology in reverse:
+        - Production: mines data to discover confidence = freqUnion / freq
+        - Synthetic: uses target confidence as firing probability
+
+        For rule [Department=Finance] → SAP_FI_001 with confidence=0.85:
+        - If user is in Finance, grant entitlement with probability 0.85
+        - Result: mined confidence ≈ 0.85 (freqUnion/freq)
+
+        Args:
+            app_name: Application name
+            user_identity: User's attributes for matching
+            identity: User identity object
+
+        Returns:
+            (entitlements, confidence_score, confidence_bucket)
+        """
+        # Get all rules for this app
+        rules = self.rule_engine.get_rules_for_app(app_name)
+
+        if not rules:
+            return [], None, None
+
+        # Build user feature markers for matching
+        user_feature_markers = {
+            f"FEATURE:{k}={v}"
+            for k, v in user_identity.items()
+            if v is not None
+        }
+
+        # Track which rules match and fire
+        granted_entitlements = set()
+        matching_rules = []
+        fired_rules = []
+
+        for rule in rules:
+            # Check if rule matches user's attributes
+            antecedent = set(rule.antecedent_entitlements)
+
+            # Skip if empty antecedent
+            if not antecedent:
+                continue
+
+            # Check if this is a feature-based rule
+            if any(a.startswith("FEATURE:") for a in antecedent):
+                # Feature-based rule: match against user identity
+                if not antecedent.issubset(user_feature_markers):
+                    continue  # Rule doesn't match user
+            else:
+                # Entitlement-based rule: skip for now (we don't have seed entitlements)
+                continue
+
+            # Rule matches! Track it
+            matching_rules.append(rule)
+
+            # Apply rule probabilistically using its confidence as firing probability
+            # This is the KEY to ensuring mined confidence matches target confidence
+            if self.rng.random() < rule.confidence:
+                # Rule fires! Grant the consequent entitlements
+                granted_entitlements.update(rule.consequent_entitlements)
+                fired_rules.append(rule)
+
+        # Calculate confidence score and bucket
+        # For rule-based users, we use the average confidence of fired rules
+        if fired_rules:
+            avg_confidence = sum(r.confidence for r in fired_rules) / len(fired_rules)
+            score = avg_confidence
+            bucket = self._bucket_from_score(score)  # Use config-based thresholds
+        elif matching_rules:
+            # BEGIN FIX: User matched rules but none fired due to probabilistic selection
+            # The probabilistic firing (line 1395) already handles confidence distribution
+            # by using rule.confidence as firing probability
+            # Don't penalize with 0.3 multiplier - use rule confidence directly
+            avg_match_confidence = sum(r.confidence for r in matching_rules) / len(matching_rules)
+            score = avg_match_confidence  # Removed 0.3 penalty - use rule confidence as-is
+            bucket = self._bucket_from_score(score)  # Use config-based thresholds
+            # END FIX
+        else:
+            # No rules matched at all
+            score = None
+            bucket = None
+
+        return sorted(list(granted_entitlements)), score, bucket
+
     def _get_grant_count(self, app_config: Dict[str, Any], attr_name: str = None) -> int:
         """Get number of entitlements to grant using bell curve distribution."""
         grants_cfg = self.config.get('grants', {})
@@ -1303,80 +1551,194 @@ class AccountGenerator:
         return max(min_val, min(max_val, count))
 
     def generate_for_app(self, app_config: Dict[str, Any]) -> List[Account]:
-        """Generate accounts for a single application."""
+        """
+        Generate accounts for a single application using deterministic quota-based assignment.
+
+        This replaces the probabilistic approach with quota-based assignment that
+        correctly produces the target mined confidence distribution.
+
+        The key formula is: mined_confidence = freqUnion / freq
+
+        To achieve target confidence, we deterministically select exactly
+        freqUnion_target = confidence × freq users to receive each entitlement.
+        """
         app_name = app_config['app_name']
         app_id = app_config.get('app_id', f"APP_{app_name.upper()}")
-        self.logger.info(f"Generating accounts for {app_name}...")
+        self.logger.info(f"Generating accounts for {app_name} (deterministic quota-based)...")
 
         entitlements = self.entitlements_by_app.get(app_name, [])
         if not entitlements:
             self.logger.warning(f"No entitlements found for {app_name}")
             return []
 
+        ent_ids = [e.entitlement_id for e in entitlements]
         accounts = []
 
         # Handle Epic special case
         if app_name == "Epic":
             accounts = self._generate_epic_accounts(app_config, app_id)
-        else:
-            # Standard account generation
-            ent_ids = [e.entitlement_id for e in entitlements]
+            self.accounts_by_app[app_name] = accounts
+            self.logger.info(f"Generated {len(accounts)} accounts for {app_name}")
+            return accounts
 
-            for identity in self.identities:
-                use_rules = (
-                        self.rule_engine is not None
-                        and self.rule_engine.has_rules(app_name)
-                        and identity.user_id in self.rule_following_users  # PRE-DETERMINED
+        # =================================================================
+        # BEGIN FIX: Deterministic Quota-Based Assignment
+        # =================================================================
+
+        # Step 1: Compute rule quotas
+        quotas = []
+        if self.rule_engine and self.rule_engine.has_rules(app_name):
+            quotas = self._compute_rule_quotas(app_name)
+
+        # Step 2: Assign entitlements based on quotas
+        user_assignments = {}
+        if quotas:
+            user_assignments = self._assign_entitlements_by_quota(app_name, quotas)
+            self.logger.info(
+                f"{app_name}: Quota-based assignment completed for {len(user_assignments)} users"
+            )
+
+        # =================================================================
+        # BEGIN FIX: Exclude rule consequent entitlements from random pool
+        # =================================================================
+        # Problem: If non-rule users randomly get the same entitlements that rules
+        # are assigning, it dilutes the mined confidence because those users don't
+        # match the rule's feature pattern.
+        #
+        # Example: Rule says "dept=Finance -> Ent_X with 85% confidence"
+        # - 1000 Finance users, 850 should get Ent_X (85%)
+        # - If 200 random non-Finance users also get Ent_X
+        # - Total with Ent_X = 1050, but mined confidence for Finance is still 850/1000 = 85%
+        # - HOWEVER, if the random users ARE Finance users who weren't selected,
+        #   then mined confidence = (850+N)/1000 where N is Finance users who got it randomly
+        #
+        # Solution: Non-rule users should NOT receive entitlements that are rule consequents.
+        # This ensures only the quota-selected users have those entitlements for each pattern.
+
+        rule_consequent_ents = set()
+        if quotas:
+            for quota in quotas:
+                rule_consequent_ents.update(quota.consequent_entitlements)
+            self.logger.info(
+                f"{app_name}: Reserving {len(rule_consequent_ents)} entitlements for rule-based assignment only"
+            )
+
+        # Create a filtered pool for random assignment (excludes rule consequents)
+        random_pool_ent_ids = [e for e in ent_ids if e not in rule_consequent_ents]
+
+        if len(random_pool_ent_ids) < len(ent_ids):
+            self.logger.info(
+                f"{app_name}: Random assignment pool reduced from {len(ent_ids)} to {len(random_pool_ent_ids)} entitlements"
+            )
+        # =================================================================
+        # END FIX: Exclude rule consequent entitlements from random pool
+        # =================================================================
+
+        # Step 3: Generate accounts for all users
+        for identity in self.identities:
+            user_id = identity.user_id
+
+            # Check if user is in rule-following population
+            use_rules = (
+                    self.rule_engine is not None
+                    and self.rule_engine.has_rules(app_name)
+                    and user_id in self.rule_following_users
+            )
+
+            if use_rules and user_id in user_assignments:
+                # User has rule-based assignments from quota system
+                assignment = user_assignments[user_id]
+                final_ents = sorted(list(assignment['entitlements']))
+
+                # Calculate confidence based on which rules applied
+                score, bucket = self._calculate_user_confidence(
+                    assignment['rules_applied'],
+                    assignment['rules_matched']
                 )
-                if use_rules and ent_ids:
-                    # Seed with a small random subset, then expand via rules
-                    seed_count = max(1, min(2, len(ent_ids)))
-                    seed = self.rng.choice(
-                        ent_ids,
-                        size=seed_count,
+
+                # Fallback: if no entitlements from rules, give minimal random
+                # BEGIN FIX: Use random pool (excludes rule consequents)
+                if not final_ents and random_pool_ent_ids:
+                    num_grants = max(1, self._get_grant_count(app_config) // 3)
+                    final_ents = self.rng.choice(
+                        random_pool_ent_ids,
+                        size=min(num_grants, len(random_pool_ent_ids)),
                         replace=False
                     ).tolist()
+                # END FIX
 
-                    recs, used_rules = self.rule_engine.suggest_entitlements_for_app(
-                        app_name=app_name,
-                        current_entitlements=seed,
-                        max_rules=3
-                    )
+            elif use_rules:
+                # User is in rule-following population but no rules matched
+                # Give them random entitlements with no confidence score
+                # BEGIN FIX: Use random pool (excludes rule consequents)
+                num_grants = self._get_grant_count(app_config)
+                if num_grants == 0 and random_pool_ent_ids:
+                    num_grants = 1
 
-                    final_ents = sorted(set(seed + recs))
-                    coverage = RuleEngine.compute_rule_coverage(final_ents, used_rules)
-                    score = RuleEngine.score_from_coverage_and_conf(coverage, used_rules)
-                    bucket = RuleEngine.bucket_from_score(score)
-
-                    if used_rules:
-                        self._rules_used[(app_name, identity.user_id)] = used_rules
+                if num_grants > 0 and random_pool_ent_ids:
+                    final_ents = self.rng.choice(
+                        random_pool_ent_ids,
+                        size=min(num_grants, len(random_pool_ent_ids)),
+                        replace=False
+                    ).tolist()
                 else:
-                    num_grants = self._get_grant_count(app_config)
+                    final_ents = []
+                # END FIX
 
-                    if num_grants > 0 and ent_ids:
-                        final_ents = self.rng.choice(
-                            ent_ids,
-                            size=min(num_grants, len(ent_ids)),
-                            replace=False
-                        ).tolist()
-                    else:
-                        final_ents = []
+                score = None
+                bucket = None
 
-                    score = None
-                    bucket = None
+            else:
+                # Non-rule user: random assignment
+                # BEGIN FIX: Use random pool (excludes rule consequents)
+                num_grants = self._get_grant_count(app_config)
+                if num_grants == 0 and random_pool_ent_ids:
+                    num_grants = 1
 
-                accounts.append(Account(
-                    user_id=identity.user_id,
-                    user_name=identity.user_name,
-                    app_id=app_id,
-                    app_name=app_name,
-                    entitlement_grants={'entitlement_grants': final_ents},
-                    confidence_score=score,
-                    confidence_bucket=bucket
-                ))
+                if num_grants > 0 and random_pool_ent_ids:
+                    final_ents = self.rng.choice(
+                        random_pool_ent_ids,
+                        size=min(num_grants, len(random_pool_ent_ids)),
+                        replace=False
+                    ).tolist()
+                else:
+                    final_ents = []
+                # END FIX
+
+                score = None
+                bucket = None
+
+            accounts.append(Account(
+                user_id=identity.user_id,
+                user_name=identity.user_name,
+                app_id=app_id,
+                app_name=app_name,
+                entitlement_grants={'entitlement_grants': final_ents},
+                confidence_score=score,
+                confidence_bucket=bucket
+            ))
+
+        # =================================================================
+        # END FIX: Deterministic Quota-Based Assignment
+        # =================================================================
+
+        # =================================================================
+        # BEGIN FIX: Deduplicate accounts to ensure uniqueness
+        # =================================================================
+        accounts = self._deduplicate_accounts(accounts, app_name)
+        # =================================================================
+        # END FIX: Deduplicate accounts
+        # =================================================================
 
         self.accounts_by_app[app_name] = accounts
-        self.logger.info(f"Generated {len(accounts)} accounts for {app_name}")
+
+        # Log statistics
+        rule_users = sum(1 for a in accounts if a.confidence_score is not None)
+        self.logger.info(
+            f"{app_name}: Generated {len(accounts)} accounts "
+            f"({rule_users} with rule-based confidence)"
+        )
+
         return accounts
 
     def _generate_epic_accounts(self, app_config: Dict[str, Any], app_id: str) -> List[Account]:
@@ -1423,6 +1785,10 @@ class AccountGenerator:
                 confidence_bucket=None
             ))
 
+        # BEGIN FIX: Deduplicate Epic accounts
+        accounts = self._deduplicate_accounts(accounts, 'Epic')
+        # END FIX
+
         return accounts
 
     def generate_all(self) -> Dict[str, List[Account]]:
@@ -1444,6 +1810,10 @@ class AccountGenerator:
 
         # Ensure all entitlements of all mandatory apps are used at least once
         self._ensure_mandatory_entitlement_coverage()
+
+        # BEGIN NEW: Final safeguard - ensure NO user has zero entitlements across ALL apps
+        self._ensure_no_users_without_entitlements()
+        # END NEW
 
         return self.accounts_by_app
 
@@ -1639,6 +2009,76 @@ class AccountGenerator:
                 f"of mandatory app '{mandatory_app}'."
             )
 
+    def _ensure_no_users_without_entitlements(self) -> None:
+        """
+        Final safeguard: Ensure NO user has zero entitlements across ALL applications.
+
+        This catches any edge cases where a user might have slipped through with
+        empty entitlement lists in every app.
+        """
+        self.logger.info("Running final check: ensuring all users have at least 1 entitlement...")
+
+        # Build map of user_id -> total entitlements across all apps
+        user_total_ents = defaultdict(int)
+        for app_name, accounts in self.accounts_by_app.items():
+            for account in accounts:
+                total = sum(len(grants) for grants in account.entitlement_grants.values())
+                user_total_ents[account.user_id] += total
+
+        # Find users with zero entitlements
+        users_with_zero = [uid for uid, count in user_total_ents.items() if count == 0]
+
+        if not users_with_zero:
+            self.logger.info(f"✓ All {len(self.identities)} users have at least 1 entitlement")
+            return
+
+        self.logger.warning(f"Found {len(users_with_zero)} users with ZERO entitlements - fixing...")
+
+        # Fix each user by giving them 1 entitlement in a random app
+        for user_id in users_with_zero:
+            # Pick a random app that has entitlements
+            available_apps = [
+                app_name for app_name, ents in self.entitlements_by_app.items()
+                if ents  # Has entitlements available
+            ]
+
+            if not available_apps:
+                self.logger.error("No apps have entitlements available - cannot fix zero-entitlement users")
+                continue
+
+            # Choose random app
+            app_name = self.rng.choice(available_apps)
+            entitlements = self.entitlements_by_app[app_name]
+
+            # Find this user's account in the chosen app
+            accounts = self.accounts_by_app.get(app_name, [])
+            user_account = None
+            for account in accounts:
+                if account.user_id == user_id:
+                    user_account = account
+                    break
+
+            if not user_account:
+                self.logger.warning(f"Could not find account for user {user_id} in {app_name}")
+                continue
+
+            # Grant 1 random entitlement
+            random_ent = self.rng.choice(entitlements)
+
+            # Determine attribute name (handle Epic special case)
+            if app_name == "Epic":
+                attr_name = 'linkedTemplates' if random_ent.entitlement_type == 'linkedTemplates' else 'linkedSubTemplates'
+            else:
+                attr_name = 'entitlement_grants'
+
+            # Add the entitlement
+            user_account.entitlement_grants.setdefault(attr_name, [])
+            if random_ent.entitlement_id not in user_account.entitlement_grants[attr_name]:
+                user_account.entitlement_grants[attr_name].append(random_ent.entitlement_id)
+                self.logger.debug(f"  Fixed user {user_id}: granted {random_ent.entitlement_id} in {app_name}")
+
+        self.logger.info(f"✓ Fixed {len(users_with_zero)} users who had zero entitlements")
+
     def _enforce_grant_distribution(self) -> None:
         """Ensure 80% of users have at least 3 entitlements across all apps."""
         grants_cfg = self.config.get('grants', {})
@@ -1777,10 +2217,269 @@ class AccountGenerator:
                 self.rule_following_users.add(identity.user_id)
                 count_random += 1
 
-            self.logger.info(
-                f"✓ Rule-following population: {len(self.rule_following_users)} total "
-                f"({count_forced} forced from schema, {count_random} random selections)"
+        self.logger.info(
+            f"✓ Rule-following population: {len(self.rule_following_users)} total "
+            f"({count_forced} forced from schema, {count_random} random selections)"
+        )
+
+    # =========================================================================
+    # BEGIN FIX: Deterministic Quota-Based Rule Application
+    # =========================================================================
+
+    def _build_user_feature_index(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Build an index of user_id -> feature markers for efficient rule matching.
+
+        Returns:
+            Dict mapping user_id to dict containing 'markers' (set) and 'raw' (dict)
+        """
+        user_features = {}
+
+        for identity in self.identities:
+            features = {
+                'department': identity.department,
+                'job_level': identity.job_level,
+                'employment_type': identity.employment_type,
+                'business_unit': identity.business_unit,
+                'job_category': identity.job_category,
+                'location_country': identity.location_country,
+                'has_manager': 'Yes' if identity.manager else 'No',
+                'is_manager': identity.is_manager,
+                'department_type': identity.department_type,
+                'location_site': identity.location_site,
+                'jobcode': identity.jobcode,
+            }
+
+            # Convert to FEATURE: markers
+            markers = {
+                f"FEATURE:{k}={v}"
+                for k, v in features.items()
+                if v is not None
+            }
+
+            user_features[identity.user_id] = {
+                'markers': markers,
+                'raw': features
+            }
+
+        return user_features
+
+    def _compute_rule_quotas(self, app_name: str) -> List[RuleQuota]:
+        """
+        Compute quotas for each rule based on target confidence.
+
+        For each rule:
+        1. Count users matching antecedent (freq)
+        2. Calculate freqUnion_target = confidence × freq
+
+        This ensures that when rules are mined from the generated data,
+        the mined confidence will match the target confidence.
+
+        Args:
+            app_name: Application name
+
+        Returns:
+            List of RuleQuota objects with computed quotas
+        """
+        rules = self.rule_engine.get_rules_for_app(app_name)
+        if not rules:
+            return []
+
+        # Build user feature index if not already built
+        if not hasattr(self, '_user_feature_index'):
+            self._user_feature_index = self._build_user_feature_index()
+
+        quotas = []
+
+        for rule in rules:
+            antecedent = set(rule.antecedent_entitlements)
+
+            # Skip rules without feature-based antecedents
+            if not antecedent or not any(a.startswith("FEATURE:") for a in antecedent):
+                continue
+
+            # Count users matching this antecedent (freq)
+            # Only consider users in rule_following_users population
+            matching_user_ids = []
+            for user_id in self.rule_following_users:
+                user_data = self._user_feature_index.get(user_id)
+                if user_data and antecedent.issubset(user_data['markers']):
+                    matching_user_ids.append(user_id)
+
+            freq = len(matching_user_ids)
+
+            if freq == 0:
+                continue
+
+            # Calculate target freqUnion = confidence × freq
+            # This is the KEY formula: to achieve mined confidence = target confidence,
+            # we need exactly this many users to have the entitlement
+            freqUnion_target = int(round(rule.confidence * freq))
+
+            # Ensure at least 1 if freq > 0 and confidence > 0
+            if freqUnion_target == 0 and freq > 0 and rule.confidence > 0:
+                freqUnion_target = 1
+
+            quota = RuleQuota(
+                rule_id=rule.id,
+                app_name=app_name,
+                antecedent_markers=antecedent,
+                consequent_entitlements=list(rule.consequent_entitlements),
+                confidence=rule.confidence,
+                freq=freq,
+                freqUnion_target=freqUnion_target,
+                matching_users=matching_user_ids
             )
+
+            quotas.append(quota)
+
+        self.logger.info(
+            f"{app_name}: Computed quotas for {len(quotas)} rules"
+        )
+
+        # Log sample quotas for debugging
+        for quota in quotas[:3]:
+            self.logger.debug(
+                f"  Rule {quota.rule_id}: freq={quota.freq}, "
+                f"freqUnion_target={quota.freqUnion_target}, "
+                f"target_conf={quota.confidence:.2%}"
+            )
+
+        return quotas
+
+    def _assign_entitlements_by_quota(
+            self,
+            app_name: str,
+            quotas: List[RuleQuota]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Deterministically assign entitlements based on rule quotas.
+
+        For each rule, selects exactly freqUnion_target users from those
+        matching the antecedent to receive the consequent entitlements.
+
+        CRITICAL FIX: Uses stable user ordering to ensure nested/overlapping
+        patterns select CONSISTENT user subsets. Without this, rules with
+        overlapping patterns would select different random subsets, diluting
+        the mined confidence.
+
+        Example problem without stable ordering:
+        - Rule A: {dept=Finance} → Ent_X (85% conf) selects users [1,2,3,4,5]
+        - Rule B: {dept=Finance, level=Mid} → Ent_X (85% conf) selects [2,6,7,8,9]
+        - Mined confidence for {dept=Finance} → Ent_X becomes ~50% instead of 85%
+
+        With stable ordering:
+        - Users are sorted by user_id before selection
+        - Rule A selects first 85% = [1,2,3,4,5]
+        - Rule B (subset of A's users) selects first 85% = [2,3] (subset remains consistent)
+        - Mined confidence stays at 85%
+
+        Args:
+            app_name: Application name
+            quotas: List of RuleQuota objects
+
+        Returns:
+            Dict mapping user_id -> {
+                'entitlements': set of entitlement IDs,
+                'rules_applied': list of RuleQuota that granted entitlements,
+                'rules_matched': list of RuleQuota that matched but didn't grant
+            }
+        """
+        # Track assignments per user
+        user_assignments: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {
+                'entitlements': set(),
+                'rules_applied': [],
+                'rules_matched': []
+            }
+        )
+
+        # =================================================================
+        # BEGIN FIX: Stable user ordering for consistent selection
+        # =================================================================
+
+        # Sort quotas by confidence (descending) to prioritize high-confidence rules
+        sorted_quotas = sorted(quotas, key=lambda q: q.confidence, reverse=True)
+
+        for quota in sorted_quotas:
+            matching_users = list(quota.matching_users)
+
+            if not matching_users:
+                continue
+
+            # CRITICAL FIX: Sort users by user_id for STABLE ordering
+            # This ensures that for overlapping patterns (e.g., {dept=Finance} vs
+            # {dept=Finance, level=Mid}), the selected users are consistent subsets.
+            #
+            # Without this: random shuffle causes different 85% selections for each rule
+            # With this: first 85% is always the same users (sorted by ID)
+            matching_users_sorted = sorted(matching_users)
+
+            # Select exactly freqUnion_target users from the SORTED list
+            # This is deterministic: always selects the first N users by ID
+            selected_users = matching_users_sorted[:quota.freqUnion_target]
+            non_selected_users = matching_users_sorted[quota.freqUnion_target:]
+
+            # Assign entitlements to selected users
+            for user_id in selected_users:
+                user_assignments[user_id]['entitlements'].update(
+                    quota.consequent_entitlements
+                )
+                user_assignments[user_id]['rules_applied'].append(quota)
+                quota.assigned_users.add(user_id)
+
+            # Track matched-but-not-granted for non-selected users
+            for user_id in non_selected_users:
+                user_assignments[user_id]['rules_matched'].append(quota)
+
+            self.logger.debug(
+                f"Rule {quota.rule_id}: Assigned to {len(selected_users)}/{quota.freq} users "
+                f"(target confidence: {quota.confidence:.2%})"
+            )
+
+        # =================================================================
+        # END FIX: Stable user ordering
+        # =================================================================
+
+        return dict(user_assignments)
+
+    def _calculate_user_confidence(
+            self,
+            rules_applied: List[RuleQuota],
+            rules_matched: List[RuleQuota]
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """
+        Calculate confidence score and bucket for a user based on rules.
+
+        Args:
+            rules_applied: Rules that granted entitlements to this user
+            rules_matched: Rules that matched but didn't grant (user wasn't selected)
+
+        Returns:
+            (confidence_score, confidence_bucket)
+        """
+        if rules_applied:
+            # User got entitlements from rules - use average confidence of applied rules
+            avg_confidence = sum(r.confidence for r in rules_applied) / len(rules_applied)
+            score = avg_confidence
+            bucket = self._bucket_from_score(score)
+        elif rules_matched:
+            # User matched rules but wasn't selected for entitlements
+            # This represents the (1 - confidence) portion of users
+            # Give them a reduced score to indicate partial match
+            avg_confidence = sum(r.confidence for r in rules_matched) / len(rules_matched)
+            score = avg_confidence * 0.3  # Reduced score for non-granted matches
+            bucket = self._bucket_from_score(score)
+        else:
+            # No rules matched at all
+            score = None
+            bucket = None
+
+        return score, bucket
+
+    # =========================================================================
+    # END FIX: Deterministic Quota-Based Rule Application
+    # =========================================================================
 
 
 # =============================================================================
@@ -1946,7 +2645,8 @@ class FeatureValidator:
                     results['errors'].append(f"Feature '{feature}' is constant (only {unique_count} unique value)")
                     results['status'] = 'failed'
                 elif unique_count > max_unique:
-                    results['warnings'].append(f"Feature '{feature}' has high cardinality ({unique_count} > {max_unique})")
+                    results['warnings'].append(
+                        f"Feature '{feature}' has high cardinality ({unique_count} > {max_unique})")
             else:
                 results['errors'].append(f"Mandatory feature '{feature}' not found in identities")
                 results['status'] = 'failed'
@@ -2024,7 +2724,8 @@ class DataWriter:
         self.logger = logging.getLogger(self.__class__.__name__)
 
         self.output_dir = Path(config.get('global', {}).get('output_directory', './out'))
-        self.quoting = csv.QUOTE_ALL if config.get('global', {}).get('csv_quoting', 'all') == 'all' else csv.QUOTE_MINIMAL
+        self.quoting = csv.QUOTE_ALL if config.get('global', {}).get('csv_quoting',
+                                                                     'all') == 'all' else csv.QUOTE_MINIMAL
 
     def setup_output_dir(self) -> None:
         """Create output directory if it doesn't exist."""
@@ -2046,10 +2747,47 @@ class DataWriter:
         return output_path
 
     def write_accounts(self, df: pd.DataFrame, app_name: str) -> Path:
-        """Write accounts for an app to CSV."""
+        """Write accounts for an app to CSV and validate no duplicates."""
         output_path = self.output_dir / f"{app_name}_accounts.csv"
         df.to_csv(output_path, index=False, quoting=self.quoting)
         self.logger.info(f"Written {len(df)} accounts to {output_path}")
+
+        # =====================================================================
+        # BEGIN FIX: Validate no duplicate accounts after writing
+        # =====================================================================
+        # Read back and verify uniqueness
+        df_verify = pd.read_csv(output_path)
+        total_rows = len(df_verify)
+        unique_user_ids = df_verify['user_id'].nunique()
+        unique_user_names = df_verify['user_name'].nunique()
+
+        if total_rows != unique_user_ids:
+            self.logger.error(
+                f"{app_name}: DUPLICATE user_id DETECTED! "
+                f"Total rows: {total_rows}, Unique user_ids: {unique_user_ids}"
+            )
+            # Log sample duplicates for debugging
+            dup_ids = df_verify[df_verify.duplicated(subset=['user_id'], keep=False)]
+            if len(dup_ids) > 0:
+                sample = dup_ids.head(5)['user_id'].tolist()
+                self.logger.error(f"{app_name}: Sample duplicate user_ids: {sample}")
+            raise ValueError(f"Duplicate user_id found in {app_name}_accounts.csv")
+
+        if total_rows != unique_user_names:
+            self.logger.error(
+                f"{app_name}: DUPLICATE user_name DETECTED! "
+                f"Total rows: {total_rows}, Unique user_names: {unique_user_names}"
+            )
+            raise ValueError(f"Duplicate user_name found in {app_name}_accounts.csv")
+
+        self.logger.info(
+            f"{app_name}: Validated - {total_rows} rows, "
+            f"{unique_user_ids} unique user_ids, {unique_user_names} unique user_names ✓"
+        )
+        # =====================================================================
+        # END FIX: Validate no duplicate accounts
+        # =====================================================================
+
         return output_path
 
     def write_qa_summary(self, summary: Dict[str, Any]) -> Path:
@@ -2175,7 +2913,7 @@ class QAReporter:
             total = len(all_confidence_buckets)
             for bucket in ['High', 'Medium', 'Low', 'None']:
                 count = conf_counts.get(bucket, 0)
-                summary['Confidence'][bucket] = f"{count} ({count/total:.1%})"
+                summary['Confidence'][bucket] = f"{count} ({count / total:.1%})"
 
         # Validation results
         summary['Feature Validation'] = self.validation_results
@@ -2563,22 +3301,31 @@ class SyntheticDataGenerator:
         This describes what features exist and their possible values,
         WITHOUT requiring actual identity data.
 
+        CRITICAL FIX: Only include features with cardinality <= max_cardinality.
+        High-cardinality features (like department with 198 values) create rules
+        that are too specific and result in low mined confidence when validated.
+
+        The validator uses Cramér's V to select features, which naturally
+        filters out high-cardinality features. Rules must use the same
+        low-cardinality features for the mined confidence to match targets.
+
         Returns:
             Dict mapping feature names to their schemas:
             {
-                'department': {
-                    'type': 'categorical',
-                    'values': ['Engineering', 'Sales', 'Finance', ...],
-                    'distribution': {'Engineering': 0.3, 'Sales': 0.2, ...}
-                },
                 'job_level': {
                     'type': 'categorical',
                     'values': ['Junior', 'Mid', 'Senior', 'Executive'],
                     'distribution': {...}
-                }
+                },
+                ...
             }
         """
-        # BEGIN NEW METHOD
+        # BEGIN FIX: Get max_cardinality from config to filter features
+        dynamic_rules_cfg = self.config.get('dynamic_rules', {})
+        max_cardinality = dynamic_rules_cfg.get('max_cardinality', 20)
+        self.logger.info(f"Feature schema: filtering features with cardinality <= {max_cardinality}")
+        # END FIX
+
         features_cfg = self.config.get('features', {})
         mandatory_features = features_cfg.get('mandatory_features', [])
         additional_features = features_cfg.get('additional_features', [])
@@ -2592,17 +3339,20 @@ class SyntheticDataGenerator:
         dept_file = input_files.get('departments', 'input/departments.csv')
         departments = self.input_reader.read_csv(dept_file)
 
+        # BEGIN FIX: Skip department if cardinality exceeds max_cardinality
         if 'department' in all_features and departments:
             dept_names = [d.get('department_name', '') for d in departments if d.get('department_name')]
-            # Limit to reasonable cardinality for rules
-            dept_names = dept_names[:30]  # Top 30 departments
-
-            schema['department'] = {
-                'type': 'categorical',
-                'values': dept_names,
-                'cardinality': len(dept_names),
-                'distribution': 'uniform'  # Will be normalized automatically
-            }
+            # Only include if cardinality is within limit
+            if len(dept_names) <= max_cardinality:
+                schema['department'] = {
+                    'type': 'categorical',
+                    'values': dept_names,
+                    'cardinality': len(dept_names),
+                    'distribution': 'uniform'
+                }
+            else:
+                self.logger.info(f"  Skipping 'department': cardinality {len(dept_names)} > {max_cardinality}")
+        # END FIX
 
         # Load business unit values from departments
         if 'business_unit' in all_features and departments:
@@ -2636,17 +3386,20 @@ class SyntheticDataGenerator:
         job_file = input_files.get('jobtitles', 'input/jobtitles.csv')
         jobtitles = self.input_reader.read_csv(job_file)
 
+        # BEGIN FIX: Skip jobcode if cardinality exceeds max_cardinality
         if 'jobcode' in all_features and jobtitles:
             job_names = [j.get('Job Title', '') for j in jobtitles if j.get('Job Title')]
-            # Limit to reasonable cardinality
-            job_names = job_names[:40]  # Top 40 job titles
-
-            schema['jobcode'] = {
-                'type': 'categorical',
-                'values': job_names,
-                'cardinality': len(job_names),
-                'distribution': 'uniform'
-            }
+            # Only include if cardinality is within limit
+            if len(job_names) <= max_cardinality:
+                schema['jobcode'] = {
+                    'type': 'categorical',
+                    'values': job_names,
+                    'cardinality': len(job_names),
+                    'distribution': 'uniform'
+                }
+            else:
+                self.logger.info(f"  Skipping 'jobcode': cardinality {len(job_names)} > {max_cardinality}")
+        # END FIX
 
         # Load job category from jobtitles
         if 'job_category' in all_features and jobtitles:
@@ -2665,6 +3418,7 @@ class SyntheticDataGenerator:
         # Define job_level (inferred from job titles, not loaded from file)
         if 'job_level' in all_features:
             schema['job_level'] = {
+                'type': 'categorical',
                 'values': list(IdentityGenerator.JOB_LEVEL_KEYWORDS.keys()),
                 'cardinality': len(IdentityGenerator.JOB_LEVEL_KEYWORDS),
                 'distribution': IdentityGenerator.JOB_LEVEL_DISTRIBUTION
@@ -2702,6 +3456,7 @@ class SyntheticDataGenerator:
         # Define location_country
         if 'location_country' in all_features:
             schema['location_country'] = {
+                'type': 'categorical',
                 'values': list(IdentityGenerator.LOCATION_COUNTRY_DIST.keys()),
                 'cardinality': len(IdentityGenerator.LOCATION_COUNTRY_DIST),
                 'distribution': IdentityGenerator.LOCATION_COUNTRY_DIST
@@ -2713,11 +3468,17 @@ class SyntheticDataGenerator:
             for sites in IdentityGenerator.LOCATION_SITES_BY_COUNTRY.values():
                 all_sites.extend(sites.keys())
 
-            schema['location_site'] = {
-                'values': all_sites,
-                'cardinality': len(all_sites),
-                'distribution': 'uniform'  # Complex nested distribution
-            }
+            # BEGIN FIX: Respect max_cardinality for location_site
+            if len(all_sites) <= max_cardinality:
+                schema['location_site'] = {
+                    'type': 'categorical',
+                    'values': all_sites,
+                    'cardinality': len(all_sites),
+                    'distribution': 'uniform'  # Complex nested distribution
+                }
+            else:
+                self.logger.info(f"  Skipping 'location_site': cardinality {len(all_sites)} > {max_cardinality}")
+            # END FIX
 
         # Define status
         if 'status' in all_features:
@@ -2901,7 +3662,7 @@ class SyntheticDataGenerator:
         enabled_apps = [
             {'app_name': app['app_name'], 'app_id': app.get('app_id', f"APP_{app['app_name'].upper()}")}
             for app in apps_list
-                if app.get('enabled', True)
+            if app.get('enabled', True)
         ]
 
         # BEGIN NEW: Branch based on rule generation mode
@@ -3001,22 +3762,22 @@ class SyntheticDataGenerator:
                     num_patterns = int(num_patterns)
 
                 rule_gen_config = RuleGeneratorConfig(
-                num_rules_per_app=dynamic_config.get('num_rules_per_app', 5),
-                confidence_distribution=dynamic_config.get('confidence_distribution', {
-                    'high': 0.40,
-                    'medium': 0.35,
-                    'low': 0.25
-                }),
-                confidence_ranges=confidence_ranges if confidence_ranges else None,
-                support_range=support_range,
-                cramers_v_range=cramers_v_range,
-                min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
-                max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
-                min_entitlements_per_rule=dynamic_config.get('min_entitlements_per_rule', 1),
-                max_entitlements_per_rule=dynamic_config.get('max_entitlements_per_rule', 4),
-                coordinate_rules_across_apps=coordinate_rules,
-                num_unique_feature_patterns=num_patterns
-            )
+                    num_rules_per_app=dynamic_config.get('num_rules_per_app', 5),
+                    confidence_distribution=dynamic_config.get('confidence_distribution', {
+                        'high': 0.40,
+                        'medium': 0.35,
+                        'low': 0.25
+                    }),
+                    confidence_ranges=confidence_ranges if confidence_ranges else None,
+                    support_range=support_range,
+                    cramers_v_range=cramers_v_range,
+                    min_features_per_rule=dynamic_config.get('min_features_per_rule', 1),
+                    max_features_per_rule=dynamic_config.get('max_features_per_rule', 3),
+                    min_entitlements_per_rule=dynamic_config.get('min_entitlements_per_rule', 1),
+                    max_entitlements_per_rule=dynamic_config.get('max_entitlements_per_rule', 4),
+                    coordinate_rules_across_apps=coordinate_rules,
+                    num_unique_feature_patterns=num_patterns
+                )
 
             # Run original per-app rule generation orchestrator
             orchestrator = RuleGenerationOrchestrator(
@@ -3040,6 +3801,8 @@ class SyntheticDataGenerator:
             # Fall back to using existing rules if available
             self.logger.warning("Falling back to pre-defined rules from rules_directory")
     # END NEW
+
+
 # =============================================================================
 # CLI Entry Point
 # =============================================================================

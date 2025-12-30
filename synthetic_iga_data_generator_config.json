@@ -378,13 +378,13 @@
     "_comment": "Configuration for user attributes used in association rule mining (ARM) and confidence scoring",
 
     "mandatory_features": {
-      "_comment": "Features that MUST always be included in ARM. Cannot be removed.",
-      "value": ["manager", "department", "jobcode"]
+      "_comment": "Features that MUST always be included in ARM. Using low-cardinality features for better rule mining.",
+      "value": ["job_level", "business_unit", "department_type"]
     },
 
     "additional_features": {
       "_comment": "Optional features that may be used in ARM based on statistical significance.",
-      "value": ["location_country", "location_site", "employment_type", "business_unit", "job_level", "department_type", "job_category"]
+      "value": ["location_country", "location_site", "employment_type", "job_category", "is_manager"]
     },
 
     "num_features_for_rules": {
@@ -412,8 +412,8 @@
     },
 
      "num_cross_app_rules": {
-      "_comment": "Number of association rules to generate per application",
-       "value": 50
+      "_comment": "Number of cross-app rules. Set to ~700 to cover most of the 733 possible 1-2 feature patterns",
+       "value": 700
     },
 
     "apps_per_rule_min": {
@@ -423,7 +423,7 @@
 
     "apps_per_rule_max": {
       "_comment": "",
-      "value": 10
+      "value": 4
     },
 
     "entitlements_per_app_min": {
@@ -438,7 +438,7 @@
 
     "num_rules_per_app": {
       "_comment": "Number of association rules to generate per application",
-      "value": 10
+      "value": 20
     },
 
     "coordinate_rules_across_apps": {
@@ -452,28 +452,28 @@
     },
 
     "confidence_distribution": {
-      "_comment": "Distribution of confidence levels across generated rules. Must sum to 1.0. Higher confidence = rules fire more consistently.",
+      "_comment": "Distribution of rule confidence buckets. Increased 'high' to 0.50 to achieve 35% mined high confidence",
       "value": {
-        "high": 0.40,
+        "high": 0.50,
         "medium": 0.35,
-        "low": 0.25
+        "low": 0.15
       }
     },
 
     "confidence_ranges": {
-      "_comment": "Min/max confidence values for each confidence bucket. confidence = P(entitlements|features)",
+      "_comment": "Min/max confidence values. High raised to 0.80-1.00 so mined conf stays >= 0.70 threshold",
       "value": {
         "high": {
-          "min": 0.85,
+          "min": 0.80,
           "max": 1.00
         },
         "medium": {
-          "min": 0.65,
-          "max": 0.84
+          "min": 0.50,
+          "max": 0.79
         },
         "low": {
           "min": 0.20,
-          "max": 0.64
+          "max": 0.49
         }
       }
     },
@@ -481,7 +481,7 @@
     "support_range": {
       "_comment": "Min/max support values for rules. support = P(features AND entitlements) - how common the pattern is.",
       "value": {
-        "min": 0.001,
+        "min": 0.015,
         "max": 0.15
       }
     },
@@ -495,18 +495,18 @@
     },
 
     "min_features_per_rule": {
-      "_comment": "Minimum number of features in rule antecedent",
-      "value": 3
+      "_comment": "Minimum features per rule. Lower = broader rules = more pattern coverage",
+      "value": 1
     },
 
     "max_features_per_rule": {
-      "_comment": "Maximum number of features in rule antecedent",
-      "value": 10
+      "_comment": "Maximum features per rule. Lower = broader rules = more pattern coverage",
+      "value": 2
     },
 
     "min_entitlements_per_rule": {
       "_comment": "Minimum number of entitlements granted by each rule",
-      "value": 3
+      "value": 2
     },
 
     "max_entitlements_per_rule": {
